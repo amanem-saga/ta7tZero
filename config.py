@@ -29,11 +29,13 @@ MAX_RETRIES = 3                  # retries on non-rate-limit errors
 RESUME_FROM_PAGE = int(os.getenv("RESUME_FROM_PAGE", "1"))
 RESUME_FROM_INDEX = int(os.getenv("RESUME_FROM_INDEX", "0"))
 
-# --- Rate limiting ---
+# --- Rate limiting & Proxy ---
 # On rate limit detection (CONNECTION_REFUSED, 429, 403, blocked page):
-#   1. Scraper PAUSES and asks you to rotate your VPN IP
-#   2. After you press ENTER, it clears cache/cookies and resumes
-# No auto-retry — you stay in control.
+#   1. Proxy auto-rotates to the next one in proxies.txt
+#   2. Browser context is cleared (cookies/cache)
+#   3. Scraping resumes immediately
+# If ALL proxies are exhausted, pauses for user input.
+PROXY_ROTATE_AFTER_FAILURES = 2   # auto-rotate after this many consecutive failures
 
 # --- Progress reporting ---
 LOG_EVERY_N_COMPANIES = 50      # log detailed summary every N companies saved

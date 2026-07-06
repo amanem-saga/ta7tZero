@@ -50,14 +50,23 @@ def main():
     logger = logging.getLogger("main")
 
     logger.info("=" * 60)
-    logger.info("  Optimus Meknes Scraper — CloakBrowser")
+    logger.info("  Optimus Meknes Scraper")
     logger.info("=" * 60)
     logger.info(f"  Database:    SQLite (local)")
     logger.info(f"  Start page:  {args.start_page}")
     logger.info(f"  Start index: {args.start_index}")
     logger.info(f"  Max pages:   {'ALL' if args.pages == 0 else args.pages}")
-    logger.info(f"  Rate limit:  ~2s between requests (jittered)")
+    logger.info(f"  Rate limit:  ~3s between requests (jittered)")
     logger.info(f"  Log detail:  every 50th company")
+
+    # Show proxy info
+    from proxy_manager import ProxyManager
+    pm = ProxyManager()
+    if pm.total > 0:
+        logger.info(f"  Proxies:     {pm.total} loaded from proxies.txt")
+        logger.info(f"  Starting:    proxy #{pm.current_index + 1}/{pm.total}")
+    else:
+        logger.warning(f"  Proxies:     NONE — scraping will likely fail without Moroccan IP")
     logger.info("=" * 60)
 
     # Initialize database
