@@ -161,7 +161,7 @@ class ProxyManager:
 
         def check_one(proxy):
             try:
-                ok = _test_single_proxy(proxy, timeout=config.PAGE_LOAD_TIMEOUT_MS // 1000)
+                ok = _test_single_proxy(proxy, timeout=10)
             except Exception:
                 ok = False
 
