@@ -5,7 +5,6 @@ Usage is via run_scraper.py which calls launch_workers().
 """
 
 import logging
-import queue
 import threading
 from typing import Optional
 
@@ -17,8 +16,41 @@ from scraper.worker import ScrapeWorker
 logger = logging.getLogger(__name__)
 
 
+class PageCounter:
+    """Thread-safe page number generator. Workers call next_page() to get
+    the next page to scrape. Returns None when done (end detected or max reached)."""
+
+    def __init__(self, start: int, max_pages: int = 0):
+        self._current = start
+        self._max_pages = max_pages  # 0 = unlimited
+        self._count = 0
+        self._lock = threading.Lock()
+        self._ended = False  # set by a worker when it finds an empty page
+
+    def next_page(self) -> Optional[int]:
+        with self._lock:
+            if self._ended:
+                return None
+            if self._max_pages > 0 and self._count >= self._max_pages:
+                return None
+            page = self._current
+            self._current += 1
+            self._count += 1
+            return page
+
+    def mark_end(self):
+        """A worker found an empty page — signal all workers to stop."""
+        with self._lock:
+            self._ended = True
+
+    @property
+    def pages_served(self) -> int:
+        with self._lock:
+            return self._count
+
+
 def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
-    """Main entry point: health-check proxies, build page queue, launch workers.
+    """Main entry point: health-check proxies, launch workers.
 
     Args:
         num_workers: how many parallel browsers to launch
@@ -29,7 +61,6 @@ def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
     SessionLocal = init_db()
     session = get_session(SessionLocal)
     existing = count_companies(session)
-    max_logged_page = get_max_scraped_page(session)
     session.close()
 
     if existing > 0:
@@ -56,38 +87,25 @@ def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
         logger.warning(f"Requested {num_workers} workers but only {alive} proxies alive — using {alive}")
         num_workers = alive
 
-    # ─── 4. Build page queue (DB-driven resume) ────────────────
-    page_queue = queue.Queue()
-
-    # Find where to start
+    # ─── 4. Determine start page (DB-driven resume) ───────────
     effective_start = max(start_page, 1)
     if existing > 0 and start_page <= 1:
-        # Auto-resume: find unfinished pages
         session = get_session(SessionLocal)
         unfinished = get_unfinished_pages(session, start_page=1)
         session.close()
 
         if unfinished:
             effective_start = min(unfinished)
-            logger.info(f"DB-driven resume: {len(unfinished)} unfinished pages detected, starting from page {effective_start}")
-
-    # Fill the queue
-    pages_queued = 0
-    page_num = effective_start
-    while max_pages == 0 or pages_queued < max_pages:
-        page_queue.put(page_num)
-        pages_queued += 1
-        page_num += 1
-
-    logger.info(f"Page queue: {pages_queued} pages queued (starting at {effective_start})")
+            logger.info(f"DB-driven resume: {len(unfinished)} unfinished pages, starting from page {effective_start}")
 
     # ─── 5. Launch workers ─────────────────────────────────────
     shared_results = {"saved": 0, "skipped": 0, "errors": 0, "rotations": 0}
+    page_counter = PageCounter(start=effective_start, max_pages=max_pages)
 
     logger.info(f"\n{'='*60}")
     logger.info(f"  LAUNCHING {num_workers} PARALLEL WORKERS")
     logger.info(f"  Proxies:   {alive} alive")
-    logger.info(f"  Queue:     {pages_queued} pages")
+    logger.info(f"  Start:     page {effective_start} ({'ALL' if max_pages == 0 else max_pages} pages)")
     logger.info(f"  Existing:  {existing} companies in DB")
     logger.info(f"{'='*60}\n")
 
@@ -98,7 +116,7 @@ def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
         w = ScrapeWorker(
             worker_id=i + 1,
             proxy_mgr=pm,
-            page_queue=page_queue,
+            page_counter=page_counter,
             session_factory=SessionLocal,
             results=shared_results,
         )
@@ -124,6 +142,7 @@ def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
 
     logger.info(f"\n{'='*60}")
     logger.info(f"  ALL WORKERS FINISHED")
+    logger.info(f"  Pages served:         {page_counter.pages_served}")
     logger.info(f"  New saved this run:    {new_saved}")
     logger.info(f"  Total in DB:           {final_count}")
     logger.info(f"  Proxy rotations:       {shared_results['rotations']}")

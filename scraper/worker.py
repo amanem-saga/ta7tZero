@@ -184,19 +184,19 @@ class ScrapeWorker:
     On rate-limit: rotates proxy via ProxyManager, rebuilds context.
     """
 
-    def __init__(self, worker_id: int, proxy_mgr, page_queue, session_factory,
+    def __init__(self, worker_id: int, proxy_mgr, page_counter, session_factory,
                  results: dict):
         """
         Args:
             worker_id: unique int for this worker
             proxy_mgr: ProxyManager instance (shared)
-            page_queue: thread-safe queue of (page_num,) tuples
+            page_counter: PageCounter — thread-safe page number generator
             session_factory: SQLAlchemy sessionmaker
             results: shared dict to report stats {saved, skipped, errors, rotations}
         """
         self.worker_id = worker_id
         self.proxy_mgr = proxy_mgr
-        self.page_queue = page_queue
+        self.page_counter = page_counter
         self.SessionLocal = session_factory
         self.results = results  # shared, thread-safe via GIL for simple ints
 
@@ -380,7 +380,7 @@ class ScrapeWorker:
     # ─── Main worker loop ───────────────────────────────────────
 
     def run(self):
-        """Main loop: pull pages from queue, scrape until queue is empty."""
+        """Main loop: grab next page from counter, scrape until end."""
         session = self.SessionLocal()
         try:
             # Acquire proxy and launch browser
@@ -391,21 +391,16 @@ class ScrapeWorker:
 
             self._launch_browser()
 
-            # Pull pages from the shared queue
             while True:
-                try:
-                    page_num = self.page_queue.get_nowait()
-                except Exception:
-                    # Queue empty — we're done
-                    break
+                page_num = self.page_counter.next_page()
+                if page_num is None:
+                    break  # max_pages reached or end signaled
 
                 has_more = self._scrape_page(page_num, session)
-                self.page_queue.task_done()
 
                 if not has_more:
-                    # This page was empty — signal end to other workers
-                    # by draining the queue
-                    self._drain_queue()
+                    # Empty page = end of listing, signal all workers
+                    self.page_counter.mark_end()
                     break
 
         finally:
@@ -424,16 +419,3 @@ class ScrapeWorker:
                 f"saved: {self._saved}, skipped: {self._skipped}, "
                 f"errors: {self._errors}, rotations: {self._rotations}"
             )
-
-    def _drain_queue(self):
-        """Drain remaining pages from queue (another worker found the end)."""
-        drained = 0
-        while True:
-            try:
-                self.page_queue.get_nowait()
-                self.page_queue.task_done()
-                drained += 1
-            except Exception:
-                break
-        if drained > 0:
-            logger.info(f"[W{self.worker_id}] Drained {drained} pages from queue (end detected)")
