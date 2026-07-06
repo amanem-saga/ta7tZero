@@ -51,9 +51,10 @@ def launch_workers(num_workers: int, start_page: int = 1, max_pages: int = 0):
         print("\n  ERROR: All proxies failed health check. Check proxies.txt.\n")
         return
 
-    # ─── 3. Auto-set workers = all alive proxies ───────────────
-    num_workers = alive
-    logger.info(f"Launching 1 browser per alive proxy: {num_workers} workers")
+    # ─── 3. Cap workers to available proxies ──────────────────
+    if num_workers > alive:
+        logger.warning(f"Requested {num_workers} workers but only {alive} proxies alive — using {alive}")
+        num_workers = alive
 
     # ─── 4. Build page queue (DB-driven resume) ────────────────
     page_queue = queue.Queue()
