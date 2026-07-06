@@ -75,47 +75,15 @@ def _append_to_file(filepath: Path, raw_line: str):
 
 # ─── Health check ────────────────────────────────────────────────────
 
-def _test_single_proxy(proxy: dict, timeout: int = 10) -> bool:
-    """Test if a proxy is reachable (TCP connect + HTTP auth through it)."""
+def _test_single_proxy(proxy: dict, timeout: int = 5) -> bool:
+    """Test if proxy port is reachable via TCP."""
     import socket
-    import urllib.request
-    import ssl
-
-    proxy_url = f"http://{proxy['username']}:{proxy['password']}@{proxy['host']}:{proxy['port']}"
-
-    # Step 1: quick TCP check
     try:
-        sock = socket.create_connection((proxy['host'], proxy['port']), timeout=5)
+        sock = socket.create_connection((proxy['host'], proxy['port']), timeout=timeout)
         sock.close()
+        return True
     except Exception:
         return False
-
-    # Step 2: full HTTP request through proxy (ignore SSL)
-    handler = None
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        proxy_handler = urllib.request.ProxyHandler({
-            "http": proxy_url,
-            "https": proxy_url,
-        })
-        https_handler = urllib.request.HTTPSHandler(context=ctx)
-        opener = urllib.request.build_opener(proxy_handler, https_handler)
-        handler = opener.open(
-            urllib.request.Request(config.BASE_URL, headers={"User-Agent": "Mozilla/5.0"}),
-            timeout=timeout,
-        )
-        return handler.status == 200
-    except Exception:
-        return False
-    finally:
-        if handler:
-            try:
-                handler.close()
-            except Exception:
-                pass
 
 
 # ─── ProxyManager ───────────────────────────────────────────────────
@@ -176,7 +144,7 @@ class ProxyManager:
 
         def check_one(proxy):
             try:
-                ok = _test_single_proxy(proxy, timeout=10)
+                ok = _test_single_proxy(proxy)
             except Exception:
                 ok = False
 
