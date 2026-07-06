@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEAD_FILE = config.BASE_DIR / "proxies_dead.txt"
 EXHAUSTED_FILE = config.BASE_DIR / "proxies_exhausted.txt"
+BURNED_FILE = config.BASE_DIR / "proxies_burned.txt"
 STATE_FILE = config.BASE_DIR / "data" / ".proxy_state"
 
 
@@ -105,6 +106,7 @@ class ProxyManager:
         self._lock = threading.Lock()
         self._exhausted_count = 0
         self._dead_count = 0
+        self._burned_count = 0
 
     @property
     def total_alive(self) -> int:
@@ -118,6 +120,10 @@ class ProxyManager:
     @property
     def dead_count(self) -> int:
         return self._dead_count
+
+    @property
+    def burned_count(self) -> int:
+        return self._burned_count
 
     def load(self):
         """Load proxies from proxies.txt."""
@@ -227,11 +233,45 @@ class ProxyManager:
             if self._available:
                 new_proxy = self._available.pop(0)
                 self._in_use[worker_id] = new_proxy
+                self._sync_to_disk()
                 logger.info(
                     f"Worker {worker_id} new proxy: {new_proxy['server']} "
                     f"({len(self._available)} remaining)"
                 )
                 return new_proxy
+            self._sync_to_disk()
+            return None
+
+    def _sync_to_disk(self):
+        """Rewrite proxies.txt with current pool (available + in-use) to persist removals."""
+        all_alive = list(self._available) + list(self._in_use.values())
+        with open(config.BASE_DIR / "proxies.txt", "w") as f:
+            for p in all_alive:
+                f.write(p["raw"] + "\n")
+
+    def burn(self, worker_id: int) -> Optional[dict]:
+        """Mark current proxy as burned (tunnel/proxy connection failure),
+        save to proxies_burned.txt, and acquire a new one."""
+        with self._lock:
+            old_proxy = self._in_use.pop(worker_id, None)
+            if old_proxy:
+                self._burned_count += 1
+                _append_to_file(BURNED_FILE, old_proxy["raw"])
+                logger.info(
+                    f"Proxy BURNED #{self._burned_count}: "
+                    f"{old_proxy['server']} → moved to {BURNED_FILE.name}"
+                )
+
+            if self._available:
+                new_proxy = self._available.pop(0)
+                self._in_use[worker_id] = new_proxy
+                self._sync_to_disk()
+                logger.info(
+                    f"Worker {worker_id} new proxy after burn: {new_proxy['server']} "
+                    f"({len(self._available)} remaining)"
+                )
+                return new_proxy
+            self._sync_to_disk()
             return None
 
     def rotate(self, worker_id: int) -> Optional[dict]:
@@ -244,5 +284,6 @@ class ProxyManager:
                 f"Alive: {len(self._available)} | "
                 f"In-use: {len(self._in_use)} | "
                 f"Exhausted: {self._exhausted_count} | "
-                f"Dead: {self._dead_count}"
+                f"Dead: {self._dead_count} | "
+                f"Burned: {self._burned_count}"
             )

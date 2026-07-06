@@ -71,27 +71,23 @@ def main():
     parser = argparse.ArgumentParser(
         description="Scrape Optimus.ma companies in Meknes into a database."
     )
+    parser.add_argument("--workers", "-w", type=int, default=5,
+                        help="Parallel browsers (default: 5)")
+    parser.add_argument("--start-page", type=int, default=1,
+                        help="Page to start from (1 = auto-resume)")
+    parser.add_argument("--pages", type=int, default=0,
+                        help="Max pages (0 = all)")
+    parser.add_argument("--skip-health-check", action="store_true",
+                        help="Skip proxy health check")
+
     sub = parser.add_subparsers(dest="command")
 
-    # scrape (default)
-    sp = sub.add_parser("scrape", help="Run the scraper (default)")
-    sp.add_argument("--workers", "-w", type=int, default=5,
-                    help="Parallel browsers (default: 5)")
-    sp.add_argument("--start-page", type=int, default=1,
-                    help="Page to start from (1 = auto-resume)")
-    sp.add_argument("--pages", type=int, default=0,
-                    help="Max pages (0 = all)")
-    sp.add_argument("--skip-health-check", action="store_true",
-                    help="Skip proxy health check")
-
-    # dedup
+    sub.add_parser("scrape", help="Run the scraper (default)")
     sub.add_parser("dedup", help="Remove duplicate companies from DB")
 
     args = parser.parse_args()
 
-    # Default to scrape if no subcommand
     if args.command is None or args.command == "scrape":
-        # Support legacy: `python run_scraper.py -w 5` without subcommand
         cmd_scrape(args)
     elif args.command == "dedup":
         cmd_dedup(args)

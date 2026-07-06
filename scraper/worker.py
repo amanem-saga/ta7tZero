@@ -171,8 +171,20 @@ def _is_rate_limited(error: Exception) -> bool:
     return False
 
 
+def _is_tunnel_failure(error: Exception) -> bool:
+    """Check if error indicates the proxy tunnel itself is dead (not just rate-limited).
+    These errors mean the proxy server is unreachable and should be burned."""
+    s = str(error).upper()
+    return "ERR_TUNNEL_CONNECTION_FAILED" in s
+
+
 def _jittered_delay(base_ms: int):
     time.sleep(base_ms / 1000 * random.uniform(0.7, 1.3))
+
+
+def _jittered_delay_range(min_ms: int, max_ms: int):
+    """Sleep for a random duration between min_ms and max_ms milliseconds."""
+    time.sleep(random.randint(min_ms, max_ms) / 1000)
 
 
 # ─── Worker ─────────────────────────────────────────────────────────
@@ -209,24 +221,36 @@ class ScrapeWorker:
         self._skipped = 0
         self._errors = 0
         self._rotations = 0
+        self._rate_limit_hits = 0
 
     # ─── Browser lifecycle ──────────────────────────────────────
 
     def _launch_browser(self):
-        """Launch CloakBrowser."""
+        """Launch CloakBrowser with stealth fingerprint."""
         from cloakbrowser import launch
 
         logger.info(f"[W{self.worker_id}] Launching CloakBrowser...")
         self.browser = launch(
             headless=config.CLOAK_HEADLESS,
             humanize=config.CLOAK_HUMANIZE,
+            human_preset=config.CLOAK_HUMAN_PRESET,
+            locale=config.BROWSER_LOCALE,
+            timezone=config.BROWSER_TIMEZONE,
         )
         self._create_context()
         logger.info(f"[W{self.worker_id}] CloakBrowser ready")
 
     def _create_context(self):
-        """Create fresh browser context with current proxy."""
-        ctx_kwargs = {"ignore_https_errors": config.CLOAK_IGNORE_HTTPS_ERRORS}
+        """Create fresh browser context with stealth fingerprint and request interception."""
+        ctx_kwargs = {
+            "ignore_https_errors": config.CLOAK_IGNORE_HTTPS_ERRORS,
+            "geolocation": {
+                "latitude": config.BROWSER_LATITUDE,
+                "longitude": config.BROWSER_LONGITUDE,
+            },
+            "permissions": ["geolocation"],
+            "extra_http_headers": config.BROWSER_EXTRA_HEADERS,
+        }
         if self._proxy:
             ctx_kwargs["proxy"] = {
                 "server": self._proxy["server"],
@@ -236,6 +260,7 @@ class ScrapeWorker:
         self._context = self.browser.new_context(**ctx_kwargs)
         self.page = self._context.new_page()
         self.page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
+        self._setup_request_interception()
 
     def _rotate_proxy(self):
         """Rotate proxy and rebuild context."""
@@ -260,6 +285,23 @@ class ScrapeWorker:
         )
         return True
 
+    def _burn_proxy_and_restart(self) -> bool:
+        """Burn current proxy (tunnel failure), close browser, launch new one."""
+        self._rotations += 1
+        new_proxy = self.proxy_mgr.burn(self.worker_id)
+        if new_proxy is None:
+            logger.error(f"[W{self.worker_id}] No more proxies available after burn!")
+            return False
+
+        self._close_browser()
+        self._proxy = new_proxy
+        self._launch_browser()
+        logger.info(
+            f"[W{self.worker_id}] Browser restarted with new proxy after burn "
+            f"#{self._rotations}: {self._proxy['server']}"
+        )
+        return True
+
     def _close_browser(self):
         try:
             if self._context:
@@ -272,13 +314,63 @@ class ScrapeWorker:
         except Exception:
             pass
 
+    def _setup_request_interception(self):
+        """Block tracking/analytics domains to reduce fingerprint surface."""
+        blocked = config.BLOCKED_DOMAINS
+
+        def handle_route(route):
+            url = route.request.url
+            if any(d in url for d in blocked):
+                route.abort()
+            else:
+                route.continue_()
+
+        try:
+            self.page.route("**/*", handle_route)
+        except Exception:
+            pass
+
+    def _human_scroll(self):
+        """Simulate human-like reading scroll before extracting content."""
+        try:
+            scroll_steps = random.randint(3, 6)
+            self.page.evaluate(f"""() => {{
+                const sh = document.body.scrollHeight;
+                const vh = window.innerHeight;
+                const step = Math.max(1, sh - vh) / {scroll_steps};
+                let y = 0;
+                for (let i = 0; i < {scroll_steps}; i++) {{
+                    y += step * (0.6 + Math.random() * 0.8);
+                    window.scrollTo({{ top: Math.min(y, sh - vh), behavior: 'instant' }});
+                }}
+            }}""")
+            _jittered_delay(config.SCROLL_DELAY_MS)
+        except Exception:
+            pass
+
+    def _rate_limit_backoff(self):
+        """Exponential backoff after a rate-limit hit, resets on success."""
+        self._rate_limit_hits += 1
+        delay = min(
+            config.MAX_BACKOFF_MS,
+            config.INITIAL_BACKOFF_MS * (2 ** (self._rate_limit_hits - 1)),
+        )
+        delay = delay * random.uniform(0.7, 1.3)
+        logger.warning(
+            f"[W{self.worker_id}] Rate-limit backoff {delay/1000:.1f}s "
+            f"(hit #{self._rate_limit_hits})"
+        )
+        time.sleep(delay / 1000)
+
     # ─── Navigation ─────────────────────────────────────────────
 
     def _navigate(self, url: str, expected_text: str = None) -> str:
-        """Navigate, handle rate-limit with auto-rotation."""
+        """Navigate with human-like behavior, handle rate-limit with auto-rotation."""
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
                 self.page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT_MS)
+                _jittered_delay_range(500, 1500)
+                self._human_scroll()
                 html = self.page.content()
                 if len(html) < 500:
                     raise RuntimeError(f"Page too small ({len(html)} chars)")
@@ -288,11 +380,18 @@ class ScrapeWorker:
                 return html
 
             except Exception as e:
+                if _is_tunnel_failure(e):
+                    if not self._burn_proxy_and_restart():
+                        raise
+                    logger.info(f"[W{self.worker_id}] Retrying with new browser+proxy...")
+                    continue
+
                 if _is_rate_limited(e):
+                    self._rate_limit_backoff()
                     if not self._rotate_proxy():
                         raise
                     logger.info(f"[W{self.worker_id}] Retrying with new proxy...")
-                    continue  # don't consume attempt
+                    continue
 
                 cooldown = config.REQUEST_DELAY_MS / 1000 * attempt
                 logger.warning(f"[W{self.worker_id}] Error (attempt {attempt}): {str(e)[:80]}")
@@ -319,6 +418,7 @@ class ScrapeWorker:
             save_company(session, data)
             session.commit()
             self._saved += 1
+            self._rate_limit_hits = 0
 
             if self._saved % config.LOG_EVERY_N_COMPANIES == 0:
                 logger.info(
@@ -326,14 +426,17 @@ class ScrapeWorker:
                     f"Name: {data['name']} | ICE: {data.get('ice', 'N/A')}"
                 )
 
-            _jittered_delay(config.REQUEST_DELAY_MS)
+            _jittered_delay_range(config.REQUEST_DELAY_MIN_MS, config.REQUEST_DELAY_MAX_MS)
             return True
 
         except Exception as e:
             self._errors += 1
             logger.error(f"[W{self.worker_id}] ERROR {slug}: {str(e)[:80]}")
             session.rollback()
-            if _is_rate_limited(e):
+            if _is_tunnel_failure(e):
+                self._burn_proxy_and_restart()
+            elif _is_rate_limited(e):
+                self._rate_limit_backoff()
                 self._rotate_proxy()
             else:
                 time.sleep(config.REQUEST_DELAY_MS / 1000 * 2)
@@ -375,7 +478,7 @@ class ScrapeWorker:
             log_scrape(session, page_num, "completed", found=len(links), scraped=0)
             return True  # page is valid, just nothing new
 
-        _jittered_delay(config.LISTING_DELAY_MS)
+        _jittered_delay_range(config.LISTING_DELAY_MIN_MS, config.LISTING_DELAY_MAX_MS)
         logger.info(f"[W{self.worker_id}] Page {page_num}: {len(links_to_scrape)} new to scrape")
 
         scraped_count = 0

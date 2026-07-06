@@ -79,23 +79,21 @@ def get_unfinished_pages(session: Session, start_page: int = 1) -> set[int]:
       - Pages never attempted
       - Pages that failed
       - Pages started but not completed (mid-page interruption)
+
+    Scans forward from start_page up to the furthest saved company + 5,
+    ensuring no pages are missed after a restart.
     """
-    # Pages that were successfully completed with companies found
-    finished = session.query(ScrapeLog.page_number).filter(
-        ScrapeLog.status == "completed",
-        ScrapeLog.companies_found > 0,
-    ).all()
-    finished_set = {row[0] for row in finished}
+    finished = set(
+        row[0] for row in session.query(ScrapeLog.page_number).filter(
+            ScrapeLog.status == "completed",
+            ScrapeLog.companies_found > 0,
+        ).all()
+    )
 
-    # We don't know the total number of pages, so we return start_page onward
-    # minus the finished ones. The scraper will stop when it finds a page
-    # with no "Suivant" button.
-    unfinished = set()
-    for p in range(start_page, max(finished_set, default=start_page) + 2):
-        if p not in finished_set:
-            unfinished.add(p)
+    last_saved = session.query(func.max(Company.page_number)).scalar() or 0
+    scan_end = max(last_saved, max(finished, default=0)) + 5
 
-    return unfinished
+    return {p for p in range(start_page, scan_end + 1) if p not in finished}
 
 
 def count_companies(session: Session) -> int:
