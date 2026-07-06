@@ -240,13 +240,22 @@ class OptimusScraper:
         self.browser = None
         self.page = None
         self._context = None
+        self._playwright = None
         self._total_saved = 0
         self._total_skipped = 0
         self._total_errors = 0
         self._ip_rotations = 0  # how many times user rotated IP
 
     def launch(self):
-        """Launch CloakBrowser in headed mode."""
+        """Launch browser — CloakBrowser if available, plain Playwright as fallback."""
+        try:
+            self._launch_cloakbrowser()
+        except Exception as e:
+            logger.warning(f"CloakBrowser failed ({e}), falling back to plain Playwright...")
+            self._launch_playwright()
+
+    def _launch_cloakbrowser(self):
+        """Launch via CloakBrowser (stealth Chromium)."""
         from cloakbrowser import launch
 
         logger.info("Launching CloakBrowser (stealth Chromium, HEADED)...")
@@ -254,15 +263,30 @@ class OptimusScraper:
             headless=config.CLOAK_HEADLESS,
             humanize=config.CLOAK_HUMANIZE,
         )
+        self._create_context()
+        logger.info("CloakBrowser launched (headless=%s, humanize=%s)",
+                     config.CLOAK_HEADLESS, config.CLOAK_HUMANIZE)
 
-        # Create context with ignore HTTPS errors (optimus.ma has cert issues)
+    def _launch_playwright(self):
+        """Launch via plain Playwright (fallback — no stealth patches)."""
+        from playwright.sync_api import sync_playwright
+
+        logger.info("Launching plain Playwright Chromium (no stealth)...")
+        self._playwright = sync_playwright().start()
+        self.browser = self._playwright.chromium.launch(
+            headless=config.CLOAK_HEADLESS,
+        )
+        self._create_context()
+        logger.info("Playwright Chromium launched (headless=%s)",
+                     config.CLOAK_HEADLESS)
+
+    def _create_context(self):
+        """Create a fresh browser context with HTTPS errors ignored."""
         self._context = self.browser.new_context(
             ignore_https_errors=config.CLOAK_IGNORE_HTTPS_ERRORS,
         )
         self.page = self._context.new_page()
         self.page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
-        logger.info("CloakBrowser launched (headless=%s, humanize=%s)",
-                     config.CLOAK_HEADLESS, config.CLOAK_HUMANIZE)
 
     def close(self):
         """Close browser."""
@@ -270,7 +294,9 @@ class OptimusScraper:
             self._context.close()
         if self.browser:
             self.browser.close()
-            logger.info("Browser closed")
+        if hasattr(self, '_playwright') and self._playwright:
+            self._playwright.stop()
+        logger.info("Browser closed")
 
     def _clear_context_and_relaunch(self):
         """Kill the current browser context (clears cookies/cache/cookies)
@@ -283,12 +309,7 @@ class OptimusScraper:
         except Exception:
             pass
 
-        # Fresh context = clean slate
-        self._context = self.browser.new_context(
-            ignore_https_errors=config.CLOAK_IGNORE_HTTPS_ERRORS,
-        )
-        self.page = self._context.new_page()
-        self.page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
+        self._create_context()
         logger.info("Fresh browser context created — cache cleared")
 
     def _prompt_ip_rotation(self, url: str, error: Exception):
