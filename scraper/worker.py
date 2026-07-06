@@ -278,8 +278,7 @@ class ScrapeWorker:
         """Navigate, handle rate-limit with auto-rotation."""
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
-                self.page.goto(url, wait_until="domcontentloaded")
-                self.page.wait_for_load_state("networkidle", timeout=15000)
+                self.page.goto(url, wait_until="domcontentloaded", timeout=config.PAGE_LOAD_TIMEOUT_MS)
                 html = self.page.content()
                 if len(html) < 500:
                     raise RuntimeError(f"Page too small ({len(html)} chars)")
