@@ -10,11 +10,17 @@ Workflow per page:
   6. Log progress every 50 companies
   7. Wait for rate limiting
   8. Move to next page
+
+Rate-limit handling:
+  When rate limiting is detected (CONNECTION_REFUSED, 403, 429, blocked page),
+  the scraper PAUSES and asks the user to rotate their VPN IP.
+  After confirmation, it clears cache, creates a fresh browser context, and resumes.
 """
 
 import logging
 import random
 import re
+import sys
 import time
 from typing import Optional
 from urllib.parse import urljoin
@@ -204,8 +210,31 @@ def _jittered_delay(base_ms: int):
     time.sleep(delay)
 
 
+def _is_rate_limited(error: Exception) -> bool:
+    """Detect if an error is caused by rate limiting or IP blocking."""
+    err_str = str(error).upper()
+    # Connection refused / reset — site blocked the IP
+    if any(kw in err_str for kw in ("CONNECTION_REFUSED", "ERR_CONNECTION", "ERR_CONNECTION_RESET")):
+        return True
+    # HTTP rate-limit status codes
+    if any(kw in err_str for kw in ("429", "TOO MANY REQUESTS")):
+        return True
+    # HTTP forbidden — possible IP block
+    if "403" in err_str and ("FORBIDDEN" in err_str or "BLOCKED" in err_str):
+        return True
+    return False
+
+
 class OptimusScraper:
-    """Main scraper class wrapping CloakBrowser."""
+    """Main scraper class wrapping CloakBrowser.
+
+    When rate limiting is detected, the scraper:
+      1. Pauses and prints a clear message
+      2. Waits for the user to press Enter (after rotating VPN IP)
+      3. Kills the browser context, clears all cache
+      4. Creates a fresh browser context
+      5. Retries the failed request
+    """
 
     def __init__(self):
         self.browser = None
@@ -214,27 +243,25 @@ class OptimusScraper:
         self._total_saved = 0
         self._total_skipped = 0
         self._total_errors = 0
-        self._consecutive_refused = 0
+        self._ip_rotations = 0  # how many times user rotated IP
 
     def launch(self):
-        """Launch CloakBrowser."""
+        """Launch CloakBrowser in headed mode."""
         from cloakbrowser import launch
 
-        logger.info("Launching CloakBrowser (stealth Chromium)...")
-        launch_kwargs = {
-            "headless": config.CLOAK_HEADLESS,
-            "humanize": config.CLOAK_HUMANIZE,
-        }
-        self.browser = launch(**launch_kwargs)
+        logger.info("Launching CloakBrowser (stealth Chromium, HEADED)...")
+        self.browser = launch(
+            headless=config.CLOAK_HEADLESS,
+            humanize=config.CLOAK_HUMANIZE,
+        )
 
         # Create context with ignore HTTPS errors (optimus.ma has cert issues)
-        context = self.browser.new_context(
+        self._context = self.browser.new_context(
             ignore_https_errors=config.CLOAK_IGNORE_HTTPS_ERRORS,
         )
-        self.page = context.new_page()
-        self._context = context
+        self.page = self._context.new_page()
         self.page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
-        logger.info("CloakBrowser launched successfully (headless=%s, humanize=%s)",
+        logger.info("CloakBrowser launched (headless=%s, humanize=%s)",
                      config.CLOAK_HEADLESS, config.CLOAK_HUMANIZE)
 
     def close(self):
@@ -245,8 +272,73 @@ class OptimusScraper:
             self.browser.close()
             logger.info("Browser closed")
 
+    def _clear_context_and_relaunch(self):
+        """Kill the current browser context (clears cookies/cache/cookies)
+        and create a fresh one — without restarting the browser process."""
+        logger.info("Clearing browser context (cookies, cache, localStorage)...")
+        try:
+            if self._context:
+                self._context.clear_cookies()
+                self._context.close()
+        except Exception:
+            pass
+
+        # Fresh context = clean slate
+        self._context = self.browser.new_context(
+            ignore_https_errors=config.CLOAK_IGNORE_HTTPS_ERRORS,
+        )
+        self.page = self._context.new_page()
+        self.page.set_default_timeout(config.PAGE_LOAD_TIMEOUT_MS)
+        logger.info("Fresh browser context created — cache cleared")
+
+    def _prompt_ip_rotation(self, url: str, error: Exception):
+        """Print a big warning and wait for the user to rotate their VPN IP.
+        Returns True after user confirms, or raises if they want to quit."""
+        self._ip_rotations += 1
+
+        banner = f"""
+{'!'*60}
+  RATE LIMITING / IP BLOCKED (rotation #{self._ip_rotations})
+{'!'*60}
+
+  URL:    {url}
+  Error:  {str(error)[:120]}
+
+  >>> ROTATE YOUR VPN IP NOW <<<
+  Change your VPN server to get a new Moroccan IP.
+  The scraper is PAUSED and waiting for you.
+
+  After rotating, press ENTER to resume scraping.
+  (or type 'q' + ENTER to quit and save progress)
+{'!'*60}
+"""
+        print(banner, flush=True)
+        logger.warning(f"RATE LIMIT detected — waiting for user IP rotation #{self._ip_rotations}")
+
+        # Flush logs before blocking on input
+        for handler in logger.handlers:
+            handler.flush()
+
+        try:
+            user_input = input("\n  >>> Press ENTER to resume (or 'q' to quit): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Quitting...")
+            raise SystemExit(0)
+
+        if user_input == "q":
+            print("  Saving progress and exiting...")
+            raise SystemExit(0)
+
+        # User confirmed — clear cache and create fresh context
+        print("  IP rotated — clearing cache and resuming...\n", flush=True)
+        self._clear_context_and_relaunch()
+        time.sleep(2)  # brief pause for new IP to settle
+
     def _navigate_and_verify(self, url: str, expected_text: str = None) -> str:
-        """Navigate to URL, verify it loaded correctly, return HTML."""
+        """Navigate to URL, verify it loaded correctly, return HTML.
+
+        On rate-limit detection: pauses for user IP rotation instead of auto-retry.
+        """
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
                 logger.debug(f"Navigating to {url} (attempt {attempt})")
@@ -267,51 +359,29 @@ class OptimusScraper:
                             f"title='{title}', html_len={len(html)}"
                         )
 
-                self._consecutive_refused = 0  # reset counter on success
                 logger.debug(f"Page loaded in {elapsed:.1f}s, {len(html)} chars")
                 return html
 
+            except SystemExit:
+                raise  # let quit propagate
+
             except Exception as e:
-                err_str = str(e)
-                is_refused = "CONNECTION_REFUSED" in err_str or "ERR_CONNECTION" in err_str
+                # --- Rate limit detected → ask user to rotate IP ---
+                if _is_rate_limited(e):
+                    logger.error(f"Rate limit / connection blocked: {str(e)[:100]}")
+                    self._prompt_ip_rotation(url, e)
+                    # After rotation, retry this attempt (don't consume the attempt)
+                    continue
 
-                if is_refused:
-                    self._consecutive_refused += 1
-                    cooldown = config.CONNECTION_REFUSED_COOLDOWN
-                    logger.warning(
-                        f"CONNECTION REFUSED ({self._consecutive_refused} consecutive) "
-                        f"for {url.split('/')[-1]}"
-                    )
-                    # If too many refused in a row, restart browser (fresh TLS session)
-                    if self._consecutive_refused >= config.MAX_CONSECUTIVE_REFUSED:
-                        logger.warning(
-                            f"{self._consecutive_refused} consecutive REFUSED — "
-                            f"restarting browser for fresh connection..."
-                        )
-                        self._restart_browser()
-                        self._consecutive_refused = 0
-                        cooldown = 15  # shorter cooldown after restart
-                else:
-                    cooldown = config.REQUEST_DELAY_MS / 1000 * attempt
-
+                # --- Other errors: normal retry with short delay ---
+                cooldown = config.REQUEST_DELAY_MS / 1000 * attempt
+                logger.warning(f"Error on {url} (attempt {attempt}/{config.MAX_RETRIES}): {str(e)[:100]}")
                 logger.info(f"  Waiting {cooldown:.0f}s before retry...")
                 time.sleep(cooldown)
 
                 if attempt == config.MAX_RETRIES:
                     logger.error(f"All {config.MAX_RETRIES} attempts failed for {url}")
                     raise
-
-    def _restart_browser(self):
-        """Close and relaunch CloakBrowser for a fresh TLS session."""
-        try:
-            if self._context:
-                self._context.close()
-            if self.browser:
-                self.browser.close()
-        except Exception:
-            pass
-        time.sleep(2)
-        self.launch()
 
     def _has_next_page(self, page_num: int) -> bool:
         """Check if listing page has a 'Suivant' (Next) button."""
@@ -401,7 +471,8 @@ class OptimusScraper:
                 logger.info(
                     f"  [PROGRESS] Total saved: {self._total_saved} | "
                     f"Skipped (exists): {self._total_skipped} | "
-                    f"Errors: {self._total_errors}"
+                    f"Errors: {self._total_errors} | "
+                    f"IP rotations: {self._ip_rotations}"
                 )
             else:
                 logger.info(f"  [{self._total_saved}] Saved: {data['name']} "
@@ -412,20 +483,24 @@ class OptimusScraper:
 
             return data
 
+        except SystemExit:
+            raise  # let quit propagate
+
         except Exception as e:
             self._total_errors += 1
             logger.error(f"  ERROR scraping {slug}: {e}")
             session.rollback()
-            # Extra delay after error — longer if connection refused
-            if "CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION" in str(e):
-                time.sleep(config.CONNECTION_REFUSED_COOLDOWN)
-            else:
-                time.sleep(config.REQUEST_DELAY_MS / 1000 * 2)
+            # Non-rate-limit errors: short delay then continue
+            time.sleep(config.REQUEST_DELAY_MS / 1000 * 2)
             return None
 
     def scrape_all(self, session, start_page: int = 1,
                    start_index: int = 0, max_pages: int = 0):
         """Scrape all pages from start_page onwards.
+
+        When rate limiting is detected at any point, the scraper pauses and
+        asks the user to rotate their VPN IP. After confirmation it clears
+        cache and resumes from exactly where it stopped.
 
         Args:
             session: SQLAlchemy session
@@ -447,33 +522,31 @@ class OptimusScraper:
                 log_scrape(session, page_num, "started")
                 logger.info(f"\n{'='*60}")
                 logger.info(f"  SCRAPING PAGE {page_num} "
-                            f"(saved so far: {self._total_saved}, "
-                            f"errors: {self._total_errors})")
+                            f"(saved: {self._total_saved}, "
+                            f"errors: {self._total_errors}, "
+                            f"IP rotations: {self._ip_rotations})")
                 logger.info(f"{'='*60}")
 
                 # --- Load listing page ---
                 listing_ok = False
+                company_links = []
                 for listing_attempt in range(1, 4):
                     try:
                         company_links = self.scrape_listing_page(page_num)
                         listing_ok = True
                         break
+                    except SystemExit:
+                        raise
                     except Exception as e:
-                        is_refused = "CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION" in str(e)
-                        if is_refused and listing_attempt >= 2:
-                            retry_delay = config.LONG_COOLDOWN_AFTER_RESTART
-                        elif is_refused:
-                            retry_delay = config.CONNECTION_REFUSED_COOLDOWN
-                        else:
-                            retry_delay = 15
-                        logger.error(f"Listing page {page_num} failed (attempt {listing_attempt}/3): {str(e)[:100]}")
+                        # Rate limit will already be handled inside _navigate_and_verify
+                        # If we get here, it's a non-rate-limit error
+                        logger.error(f"Listing page {page_num} failed "
+                                     f"(attempt {listing_attempt}/3): {str(e)[:100]}")
                         if listing_attempt < 3:
-                            logger.info(f"  Waiting {retry_delay}s then retrying listing page {page_num}...")
-                            time.sleep(retry_delay)
+                            time.sleep(15)
                         else:
                             log_scrape(session, page_num, "failed", error=str(e)[:200])
-                            # Skip this page, move to next
-                            logger.warning(f"Page {page_num} failed 3 times — skipping to page {page_num+1}")
+                            logger.warning(f"Page {page_num} failed 3 times — skipping")
                             page_num += 1
 
                 if not listing_ok:
@@ -514,6 +587,7 @@ class OptimusScraper:
                         f"  Total saved:    {self._total_saved}\n"
                         f"  Total skipped:  {self._total_skipped}\n"
                         f"  Total errors:   {self._total_errors}\n"
+                        f"  IP rotations:   {self._ip_rotations}\n"
                         f"  This page:      {scraped_count} new, {skipped_count} skipped\n"
                     )
 
@@ -524,16 +598,19 @@ class OptimusScraper:
                     if not has_next:
                         logger.info(f"No 'Suivant' (Next) button on page {page_num} — finished!")
                         break
+                except SystemExit:
+                    raise
                 except Exception as e:
-                    # Don't break on transient errors — retry the next page check
-                    is_refused = "CONNECTION_REFUSED" in str(e) or "ERR_CONNECTION" in str(e)
-                    if is_refused:
-                        logger.warning(f"Connection refused checking next page — waiting 30s then retrying")
-                        time.sleep(config.CONNECTION_REFUSED_COOLDOWN)
+                    is_rate = _is_rate_limited(e)
+                    if is_rate:
+                        # _navigate_and_verify already prompted for IP rotation
+                        # Retry the next-page check once more
                         try:
                             has_next = self._has_next_page(page_num)
                             if not has_next:
                                 break
+                        except SystemExit:
+                            raise
                         except Exception as e3:
                             logger.error(f"Next page check failed twice: {e3}")
                             break
@@ -543,14 +620,31 @@ class OptimusScraper:
 
                 page_num += 1
 
-        finally:
-            self.close()
+        except SystemExit:
+            # User chose to quit — save progress
             logger.info(
                 f"\n{'='*60}\n"
-                f"  SCRAPING SESSION FINISHED\n"
-                f"  Total saved:   {self._total_saved}\n"
-                f"  Total skipped: {self._total_skipped}\n"
-                f"  Total errors:  {self._total_errors}\n"
-                f"  Last page:     {page_num}\n"
+                f"  SCRAPING PAUSED (user quit)\n"
+                f"  Total saved:    {self._total_saved}\n"
+                f"  Total skipped:  {self._total_skipped}\n"
+                f"  Total errors:   {self._total_errors}\n"
+                f"  IP rotations:   {self._ip_rotations}\n"
+                f"  Last page:      {page_num}\n"
+                f"  Resume with:    python run_scraper.py --start-page {page_num}\n"
                 f"{'='*60}"
             )
+            raise
+
+        finally:
+            self.close()
+            if not isinstance(sys.exc_info()[1], SystemExit):
+                logger.info(
+                    f"\n{'='*60}\n"
+                    f"  SCRAPING SESSION FINISHED\n"
+                    f"  Total saved:    {self._total_saved}\n"
+                    f"  Total skipped:  {self._total_skipped}\n"
+                    f"  Total errors:   {self._total_errors}\n"
+                    f"  IP rotations:   {self._ip_rotations}\n"
+                    f"  Last page:      {page_num}\n"
+                    f"{'='*60}"
+                )
