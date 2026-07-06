@@ -61,6 +61,46 @@ def company_exists(session: Session, slug: str) -> bool:
     return session.query(Company.id).filter(Company.slug == slug).first() is not None
 
 
+def get_unfinished_pages(session: Session, start_page: int = 1) -> set[int]:
+    """Return page numbers that need scraping (DB-driven resume).
+
+    A page is "finished" if it has a 'completed' scrape_log with
+    companies_found > 0. Everything else is unfinished:
+      - Pages never attempted
+      - Pages that failed
+      - Pages started but not completed (mid-page interruption)
+    """
+    from sqlalchemy import func
+
+    # Pages that were successfully completed with companies found
+    finished = session.query(ScrapeLog.page_number).filter(
+        ScrapeLog.status == "completed",
+        ScrapeLog.companies_found > 0,
+    ).all()
+    finished_set = {row[0] for row in finished}
+
+    # We don't know the total number of pages, so we return start_page onward
+    # minus the finished ones. The scraper will stop when it finds a page
+    # with no "Suivant" button.
+    unfinished = set()
+    for p in range(start_page, max(finished_set, default=start_page) + 2):
+        if p not in finished_set:
+            unfinished.add(p)
+
+    return unfinished
+
+
+def count_companies(session: Session) -> int:
+    """Count total companies in the database."""
+    return session.query(func.count(Company.id)).scalar() or 0
+
+
+def get_max_scraped_page(session: Session) -> int:
+    """Get the highest page number that has any log entry."""
+    result = session.query(func.max(ScrapeLog.page_number)).scalar()
+    return result or 0
+
+
 def save_company(session: Session, data: dict) -> Company:
     """Insert or update a company and its related products/brands."""
     # Parse date

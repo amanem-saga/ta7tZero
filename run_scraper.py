@@ -5,18 +5,13 @@ import logging
 import sys
 import os
 
-# Ensure project root is on the Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import BASE_DIR, LOG_LEVEL, LOG_FILE
-from db import init_db, get_session
-from scraper.scraper import OptimusScraper
 
 
 def setup_logging():
-    """Configure logging to both console and file."""
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
     fmt = "%(asctime)s [%(levelname)s] %(message)s"
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -33,16 +28,20 @@ def main():
         description="Scrape Optimus.ma companies in Meknes into a database."
     )
     parser.add_argument(
-        "--pages", type=int, default=0,
-        help="Max pages to scrape (0 = all pages). Default: 0"
+        "--workers", "-w", type=int, default=5,
+        help="Number of parallel browsers (default: 5). Each gets its own proxy."
     )
     parser.add_argument(
         "--start-page", type=int, default=1,
-        help="Page number to start from. Default: 1"
+        help="Page number to start from (default: 1 = auto-resume from DB)"
     )
     parser.add_argument(
-        "--start-index", type=int, default=0,
-        help="Company index within the start page to resume from. Default: 0"
+        "--pages", type=int, default=0,
+        help="Max pages to scrape (0 = all). Default: 0"
+    )
+    parser.add_argument(
+        "--skip-health-check", action="store_true",
+        help="Skip proxy health check (faster start, but dead proxies won't be filtered)"
     )
     args = parser.parse_args()
 
@@ -50,49 +49,38 @@ def main():
     logger = logging.getLogger("main")
 
     logger.info("=" * 60)
-    logger.info("  Optimus Meknes Scraper")
+    logger.info("  Optimus Meknes Scraper — Parallel Workers")
     logger.info("=" * 60)
-    logger.info(f"  Database:    SQLite (local)")
-    logger.info(f"  Start page:  {args.start_page}")
-    logger.info(f"  Start index: {args.start_index}")
-    logger.info(f"  Max pages:   {'ALL' if args.pages == 0 else args.pages}")
-    logger.info(f"  Rate limit:  ~3s between requests (jittered)")
-    logger.info(f"  Log detail:  every 50th company")
+    logger.info(f"  Workers:         {args.workers}")
+    logger.info(f"  Start page:      {args.start_page} (1 = auto-resume)")
+    logger.info(f"  Max pages:       {'ALL' if args.pages == 0 else args.pages}")
+    logger.info(f"  Health check:    {'SKIP' if args.skip_health_check else 'YES'}")
+    logger.info(f"  Mode:            CloakBrowser + proxy rotation")
+    logger.info("=" * 60)
 
-    # Show proxy info
+    # Import here so logging is set up first
+    from scraper.scraper import launch_workers
     from proxy_manager import ProxyManager
+
+    # Quick proxy count
     pm = ProxyManager()
-    if pm.total > 0:
-        logger.info(f"  Proxies:     {pm.total} loaded from proxies.txt")
-        logger.info(f"  Starting:    proxy #{pm.current_index + 1}/{pm.total}")
-    else:
-        logger.warning(f"  Proxies:     NONE — scraping will likely fail without Moroccan IP")
-    logger.info("=" * 60)
+    pm.load()
+    logger.info(f"  Proxies loaded:  {pm.total_alive}")
 
-    # Initialize database
-    SessionLocal = init_db()
-    session = get_session(SessionLocal)
+    if not args.skip_health_check and pm.total_alive > 0:
+        logger.info("  Running health check...")
+    elif args.skip_health_check:
+        logger.info("  Health check SKIPPED (--skip-health-check)")
 
-    # Count existing companies for resume info
-    from db.models import Company
-    existing = session.query(Company).count()
-    if existing > 0:
-        logger.info(f"  DB already has {existing} companies (will skip duplicates)")
-
-    # Full scrape
-    scraper = OptimusScraper()
+    # Launch
     try:
-        scraper.scrape_all(
-            session=session,
+        launch_workers(
+            num_workers=args.workers,
             start_page=args.start_page,
-            start_index=args.start_index,
             max_pages=args.pages,
         )
     except KeyboardInterrupt:
-        logger.info(f"\nInterrupted. Resume with:")
-        logger.info(f"  python run_scraper.py --start-page {args.start_page}")
-    finally:
-        session.close()
+        logger.info("\nInterrupted. Just re-run to resume — the DB tracks progress.")
 
 
 if __name__ == "__main__":

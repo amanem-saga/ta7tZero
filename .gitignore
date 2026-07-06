@@ -16,6 +16,10 @@ data/*.db-wal
 data/*.db-shm
 data/.proxy_state
 
+# Proxy state (generated at runtime)
+proxies_dead.txt
+proxies_exhausted.txt
+
 # Logs
 logs/
 
