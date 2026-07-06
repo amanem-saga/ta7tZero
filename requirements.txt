@@ -1,0 +1,19 @@
+# Optimus Meknes Scraper - Python Environment
+
+# Core scraping
+cloakbrowser>=0.4.0
+playwright>=1.40.0
+
+# Database
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# HTML parsing
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Date parsing
+python-dateutil>=2.8
+
+# Environment variables
+python-dotenv>=1.0
