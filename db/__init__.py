@@ -3,7 +3,7 @@
 from pathlib import Path
 import logging
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, text, func
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import Base, Company, Brand, Product, ScrapeLog
@@ -70,8 +70,6 @@ def get_unfinished_pages(session: Session, start_page: int = 1) -> set[int]:
       - Pages that failed
       - Pages started but not completed (mid-page interruption)
     """
-    from sqlalchemy import func
-
     # Pages that were successfully completed with companies found
     finished = session.query(ScrapeLog.page_number).filter(
         ScrapeLog.status == "completed",
