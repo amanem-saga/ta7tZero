@@ -5,31 +5,40 @@ __pycache__/
 dist/
 build/
 *.egg
-
-# Virtual environment
 venv/
 .venv/
 
-# Database (local SQLite)
+# Proxy state
 data/.proxy_state
-
-# Proxy state (generated at runtime)
 proxies_dead.txt
 proxies_exhausted.txt
 
 # Logs
-logs/
+*.log
+
+# Node modules
+node_modules/
+
+# Next.js build output
+.next/
+
+# Upload temp
+upload/
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# Temp files
+/tmp/
+*.tmp
 
-# Environment variables
+# Keep token file
+!.env.local
+
 .env
 .env.local
