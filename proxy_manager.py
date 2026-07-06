@@ -149,43 +149,46 @@ class ProxyManager:
             logger.warning("No proxies to health-check")
             return 0
 
-        alive = []
-        dead = []
         total = len(self._available)
-
-        logger.info(f"Health-checking {total} proxies (up to {max_threads} concurrent)...")
-        print(f"\n  Checking {total} proxies...", flush=True)
-
-        # Use threading for concurrent checks
-        results = [None] * total
+        checked = [0]  # mutable counter for closure
         lock = threading.Lock()
 
-        def check_one(idx, proxy):
+        logger.info(f"Health-checking {total} proxies (up to {max_threads} concurrent)...")
+        print(f"\n  Checking {total} proxies...\n", flush=True)
+
+        alive = []
+        dead = []
+
+        def check_one(proxy):
             try:
                 ok = _test_single_proxy(proxy, timeout=config.PAGE_LOAD_TIMEOUT_MS // 1000)
             except Exception:
                 ok = False
+
             with lock:
-                results[idx] = (proxy, ok)
+                checked[0] += 1
+                n = checked[0]
+                short = proxy["host"]
+                status = "\033[92mOK\033[0m  " if ok else "\033[91mDEAD\033[0m"
+                print(f"  [{n:>3}/{total}]  {status}  {short}:{proxy['port']}", flush=True)
 
-        threads = []
+                if ok:
+                    alive.append(proxy)
+                else:
+                    dead.append(proxy)
+
+        # Process in batches to limit concurrency
+        batch = []
         for i, proxy in enumerate(self._available):
-            t = threading.Thread(target=check_one, args=(i, proxy))
-            threads.append(t)
+            t = threading.Thread(target=check_one, args=(proxy,))
+            batch.append(t)
             t.start()
-            # Limit concurrency
-            if len(threads) >= max_threads:
-                for t in threads:
+            if len(batch) >= max_threads:
+                for t in batch:
                     t.join()
-                threads = []
-        for t in threads:
+                batch = []
+        for t in batch:
             t.join()
-
-        for proxy, ok in results:
-            if ok:
-                alive.append(proxy)
-            else:
-                dead.append(proxy)
 
         self._available = alive
         self._dead_count = len(dead)
@@ -203,7 +206,7 @@ class ProxyManager:
                 for p in alive:
                     f.write(p["raw"] + "\n")
 
-        print(f"  Result: {len(alive)} alive, {len(dead)} dead\n", flush=True)
+        print(f"\n  Result: {len(alive)} alive, {len(dead)} dead\n", flush=True)
         logger.info(f"Health check done: {len(alive)} alive, {len(dead)} dead")
         return len(alive)
 
