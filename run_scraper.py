@@ -23,28 +23,8 @@ def setup_logging():
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Scrape Optimus.ma companies in Meknes into a database."
-    )
-    parser.add_argument(
-        "--workers", "-w", type=int, default=5,
-        help="Number of parallel browsers (default: 5). Each gets its own proxy."
-    )
-    parser.add_argument(
-        "--start-page", type=int, default=1,
-        help="Page number to start from (default: 1 = auto-resume from DB)"
-    )
-    parser.add_argument(
-        "--pages", type=int, default=0,
-        help="Max pages to scrape (0 = all). Default: 0"
-    )
-    parser.add_argument(
-        "--skip-health-check", action="store_true",
-        help="Skip proxy health check (faster start, but dead proxies won't be filtered)"
-    )
-    args = parser.parse_args()
-
+def cmd_scrape(args):
+    """Run the scraper."""
     setup_logging()
     logger = logging.getLogger("main")
 
@@ -58,7 +38,6 @@ def main():
     logger.info(f"  Mode:            CloakBrowser + proxy rotation")
     logger.info("=" * 60)
 
-    # Import here so logging is set up first
     from scraper.scraper import launch_workers
     from proxy_manager import ProxyManager
 
@@ -72,7 +51,6 @@ def main():
     elif args.skip_health_check:
         logger.info("  Health check SKIPPED (--skip-health-check)")
 
-    # Launch
     try:
         launch_workers(
             num_workers=args.workers,
@@ -81,6 +59,42 @@ def main():
         )
     except KeyboardInterrupt:
         logger.info("\nInterrupted. Just re-run to resume — the DB tracks progress.")
+
+
+def cmd_dedup(_args):
+    """Remove duplicate companies from the database."""
+    from db import run_dedup
+    run_dedup()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scrape Optimus.ma companies in Meknes into a database."
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # scrape (default)
+    sp = sub.add_parser("scrape", help="Run the scraper (default)")
+    sp.add_argument("--workers", "-w", type=int, default=5,
+                    help="Parallel browsers (default: 5)")
+    sp.add_argument("--start-page", type=int, default=1,
+                    help="Page to start from (1 = auto-resume)")
+    sp.add_argument("--pages", type=int, default=0,
+                    help="Max pages (0 = all)")
+    sp.add_argument("--skip-health-check", action="store_true",
+                    help="Skip proxy health check")
+
+    # dedup
+    sub.add_parser("dedup", help="Remove duplicate companies from DB")
+
+    args = parser.parse_args()
+
+    # Default to scrape if no subcommand
+    if args.command is None or args.command == "scrape":
+        # Support legacy: `python run_scraper.py -w 5` without subcommand
+        cmd_scrape(args)
+    elif args.command == "dedup":
+        cmd_dedup(args)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 import config
-from db import company_exists, save_company, log_scrape
+from db import company_exists, save_company, log_scrape, filter_existing_slugs
 
 logger = logging.getLogger(__name__)
 
@@ -361,11 +361,26 @@ class ScrapeWorker:
             log_scrape(session, page_num, "completed", found=0)
             return False  # signal: no more pages
 
+        # ── Batch filter: skip companies already in DB ──────────
+        all_slugs = [l["slug"] for l in links]
+        new_slugs = set(filter_existing_slugs(session, all_slugs))
+        links_to_scrape = [l for l in links if l["slug"] in new_slugs]
+        skipped = len(links) - len(links_to_scrape)
+        self._skipped += skipped
+
+        if skipped > 0:
+            logger.info(f"[W{self.worker_id}] Page {page_num}: {skipped}/{len(links)} already in DB, skipping")
+
+        if not links_to_scrape:
+            logger.info(f"[W{self.worker_id}] Page {page_num}: all {len(links)} companies exist — skipping page")
+            log_scrape(session, page_num, "completed", found=len(links), scraped=0)
+            return True  # page is valid, just nothing new
+
         _jittered_delay(config.LISTING_DELAY_MS)
-        logger.info(f"[W{self.worker_id}] Page {page_num}: {len(links)} links")
+        logger.info(f"[W{self.worker_id}] Page {page_num}: {len(links_to_scrape)} new to scrape")
 
         scraped_count = 0
-        for i, link in enumerate(links):
+        for i, link in enumerate(links_to_scrape):
             if self._scrape_company(link, page_num, session):
                 scraped_count += 1
 
@@ -373,7 +388,7 @@ class ScrapeWorker:
                    found=len(links), scraped=scraped_count)
         logger.info(
             f"[W{self.worker_id}] Page {page_num} done: "
-            f"{scraped_count} new, {len(links) - scraped_count} skipped"
+            f"{scraped_count} new, {skipped} skipped"
         )
         return True  # continue
 

@@ -61,6 +61,16 @@ def company_exists(session: Session, slug: str) -> bool:
     return session.query(Company.id).filter(Company.slug == slug).first() is not None
 
 
+def filter_existing_slugs(session: Session, slugs: list[str]) -> list[str]:
+    """Return only slugs that do NOT exist in the database yet.
+    Batch query — much faster than checking one by one."""
+    if not slugs:
+        return []
+    existing = session.query(Company.slug).filter(Company.slug.in_(slugs)).all()
+    existing_set = {row[0] for row in existing}
+    return [s for s in slugs if s not in existing_set]
+
+
 def get_unfinished_pages(session: Session, start_page: int = 1) -> set[int]:
     """Return page numbers that need scraping (DB-driven resume).
 
@@ -198,3 +208,87 @@ def log_scrape(session: Session, page: int, status: str,
         log_entry.finished_at = datetime.utcnow()
     session.add(log_entry)
     session.commit()
+
+
+def dedup_companies(session: Session) -> int:
+    """Remove duplicate companies (same slug), keeping the newest.
+    Returns number of duplicates removed."""
+    # Find slugs that appear more than once
+    dup_slugs = session.query(
+        Company.slug
+    ).group_by(Company.slug).having(func.count(Company.id) > 1).all()
+
+    if not dup_slugs:
+        return 0
+
+    removed = 0
+    for (slug,) in dup_slugs:
+        # Get all IDs for this slug, sorted by id desc (newest first)
+        rows = session.query(Company.id).filter(
+            Company.slug == slug
+        ).order_by(Company.id.desc()).all()
+
+        # Keep the first (newest), delete the rest
+        keep_id = rows[0][0]
+        for (dup_id,) in rows[1:]:
+            session.execute(text("DELETE FROM products WHERE company_id = :cid"), {"cid": dup_id})
+            session.execute(text("DELETE FROM brands WHERE company_id = :cid"), {"cid": dup_id})
+            session.execute(text("DELETE FROM companies WHERE id = :cid"), {"cid": dup_id})
+            removed += 1
+
+    session.commit()
+    return removed
+
+
+def dedup_by_ice(session: Session) -> int:
+    """Remove companies with duplicate ICE numbers, keeping the one with most data.
+    Returns number removed."""
+    dup_ices = session.query(
+        Company.ice
+    ).filter(Company.ice.isnot(None)).group_by(Company.ice).having(
+        func.count(Company.id) > 1
+    ).all()
+
+    if not dup_ices:
+        return 0
+
+    removed = 0
+    for (ice_val,) in dup_ices:
+        rows = session.query(Company).filter(Company.ice == ice_val).order_by(
+            Company.id.desc()
+        ).all()
+
+        keep = rows[0]
+        for dup in rows[1:]:
+            session.execute(text("DELETE FROM products WHERE company_id = :cid"), {"cid": dup.id})
+            session.execute(text("DELETE FROM brands WHERE company_id = :cid"), {"cid": dup.id})
+            session.delete(dup)
+            removed += 1
+
+    session.commit()
+    return removed
+
+
+def run_dedup():
+    """Full dedup pipeline — run from CLI."""
+    SessionLocal = init_db()
+    session = get_session(SessionLocal)
+
+    total_before = count_companies(session)
+
+    # Dedup by slug
+    removed_slug = dedup_companies(session)
+    session = get_session(SessionLocal)  # refresh
+
+    # Dedup by ICE
+    removed_ice = dedup_by_ice(session)
+    session = get_session(SessionLocal)
+
+    total_after = count_companies(session)
+
+    print(f"\n  Dedup results:")
+    print(f"    By slug:  {removed_slug} duplicates removed")
+    print(f"    By ICE:   {removed_ice} duplicates removed")
+    print(f"    Before:   {total_before} companies")
+    print(f"    After:    {total_after} companies")
+    print(f"    Saved:    {total_before - total_after} total\n")
