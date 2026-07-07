@@ -131,17 +131,26 @@ export default function Home() {
   // Companies with mappable coords (real or geocoded)
   const mappable = filtered.filter(c => c.has_real_coords || geocodedCoords[c.slug]);
 
-  // Init Mapbox map
+  // Init Mapbox map — only when BOTH token and data are ready
   useEffect(() => {
-    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + ' chars)' : 'EMPTY') + ' data=' + !!data);
-    if (!token || mapRef.current) {
-      if (!token) dbg('BLOCKED: token is empty — map cannot initialize. Set MAPBOX_TOKEN env var on Railway.');
+    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + 'c)' : 'EMPTY') + ' data=' + !!data);
+    if (!token || !data || mapRef.current) {
+      if (!token) dbg('WAITING: token not yet available');
+      if (!data) dbg('WAITING: data not yet loaded');
+      if (mapRef.current) dbg('SKIP: map already initialized');
       return;
     }
-    // Wait a tick so the container div is actually in the DOM
+    // Wait 2 ticks so the main render's container div is painted (not the loading overlay's)
     const timer = setTimeout(() => {
       if (!mapContainer.current) {
-        dbg('BLOCKED: mapContainer ref still null after tick');
+        dbg('BLOCKED: mapContainer ref still null after delay');
+        return;
+      }
+      // Verify the container has actual dimensions
+      const rect = mapContainer.current.getBoundingClientRect();
+      dbg('Container dimensions: ' + Math.round(rect.width) + 'x' + Math.round(rect.height));
+      if (rect.width === 0 || rect.height === 0) {
+        dbg('BLOCKED: container has zero dimensions — cannot init WebGL map');
         return;
       }
       try {
@@ -160,15 +169,14 @@ export default function Home() {
           setMapLoaded(true);
         });
         map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
-        map.on('styledata', () => { if (!mapLoaded) dbg('Style data loaded'); });
         mapRef.current = map;
         dbg('Map instance created, waiting for load event...');
       } catch (err: unknown) {
         dbg('EXCEPTION creating map: ' + (err instanceof Error ? err.message : String(err)));
       }
-    }, 100);
+    }, 200);
     return () => { clearTimeout(timer); mapRef.current?.remove(); mapRef.current = null; };
-  }, [token, data]); // data dependency: container div only exists after data loads
+  }, [token, data]);
 
   // Update markers
   useEffect(() => {
@@ -334,13 +342,10 @@ export default function Home() {
     return () => clearInterval(iv);
   }, []);
 
-  // Loading overlay — map container is ALWAYS rendered below
+  // Loading overlay — map container only renders after data loads
   if (!data) return (
-    <div className="h-dvh flex flex-col bg-slate-950 overflow-hidden">
-      <div ref={mapContainer} className="flex-1 relative" />
-      <div className="absolute inset-0 flex items-center justify-center bg-slate-950 z-20">
-        <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
-      </div>
+    <div className="h-dvh flex items-center justify-center bg-slate-950">
+      <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
     </div>
   );
 
