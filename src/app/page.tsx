@@ -7,7 +7,19 @@ import { Company, CompanyData, TabView } from '@/lib/types';
 import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
 
 const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat]
-const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'; // Free, no API key, light readable style
+// Inline style — no external fetch, no CORS issues, works everywhere
+const MAP_STYLE = {
+  version: 8 as const,
+  sources: {
+    osm: {
+      type: 'raster' as const,
+      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+      tileSize: 256,
+      attribution: '© OpenStreetMap',
+    },
+  },
+  layers: [{ id: 'osm', type: 'raster' as const, source: 'osm' }],
+};
 
 // Debug logger — also renders on-screen
 const _dbgLines: string[] = [];
@@ -135,7 +147,7 @@ export default function Home() {
         return;
       }
       try {
-        dbg('Creating MapLibre GL map (CARTO dark-matter, no API key), center=' + MEKNES + ', zoom=12');
+        dbg('Creating MapLibre GL map (OSM raster tiles, inline style), center=' + MEKNES + ', zoom=12');
         const map = new maplibregl.Map({
           container: mapContainer.current,
           style: MAP_STYLE,
@@ -145,7 +157,7 @@ export default function Home() {
         });
         map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-left');
         map.on('load', () => {
-          dbg('MAP LOADED SUCCESSFULLY — style: ' + MAP_STYLE);
+          dbg('MAP LOADED SUCCESSFULLY — OSM raster tiles');
           const style = map.getStyle();
           dbg('Active style sources: ' + Object.keys(style.sources || {}).join(', '));
           setMapLoaded(true);
