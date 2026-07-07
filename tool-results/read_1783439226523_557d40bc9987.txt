@@ -1,0 +1,521 @@
+     1→'use client';
+     2→
+     3→import { useEffect, useRef, useState, useCallback } from 'react';
+     4→import mapboxgl from 'mapbox-gl';
+     5→import 'mapbox-gl/dist/mapbox-gl.css';
+     6→import { Company, CompanyData, TabView } from '@/lib/types';
+     7→import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
+     8→
+     9→const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat] for Mapbox
+    10→const SECTOR_COLORS: Record<string, string> = {
+    11→  'Commerce & Négoce': '#ef4444',
+    12→  'Bâtiment & Travaux Publics': '#f59e0b',
+    13→  'Services aux entreprises': '#3b82f6',
+    14→  'Restauration & Hôtellerie': '#f97316',
+    15→  'Industrie & Fabrication': '#8b5cf6',
+    16→  'Éducation & Formation': '#10b981',
+    17→  'Agriculture & Élevage': '#22c55e',
+    18→  'Transport & Logistique': '#f97316',
+    19→  'Technologie & Digital': '#06b6d4',
+    20→  'Automobile': '#e11d48',
+    21→  'Textile & Habillement': '#ec4899',
+    22→  'Santé & Pharmacie': '#14b8a6',
+    23→  'Agroalimentaire': '#84cc16',
+    24→};
+    25→const getColor = (s: string | null) => SECTOR_COLORS[s || ''] || '#6b7280';
+    26→
+    27→export default function Home() {
+    28→  const mapContainer = useRef<HTMLDivElement>(null);
+    29→  const mapRef = useRef<mapboxgl.Map | null>(null);
+    30→  const markersRef = useRef<mapboxgl.Marker[]>([]);
+    31→  const routeSourceRef = useRef<string | null>(null);
+    32→
+    33→  const [data, setData] = useState<CompanyData | null>(null);
+    34→  const [token, setToken] = useState('');
+    35→  const [mapLoaded, setMapLoaded] = useState(false);
+    36→
+    37→  // Read token from server-injected global
+    38→  useEffect(() => {
+    39→    const t = (window as unknown as { __MAPBOX_TOKEN__?: string }).__MAPBOX_TOKEN__;
+    40→    if (t) setToken(t);
+    41→  }, []);
+    42→  const [selectedSectors, setSelectedSectors] = useState<Set<string>>(new Set());
+    43→  const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(() => {
+    44→    if (typeof window === 'undefined') return new Set();
+    45→    try { return new Set(JSON.parse(localStorage.getItem('selected') || '[]')); } catch { return new Set(); }
+    46→  });
+    47→  const [visitedSlugs, setVisitedSlugs] = useState<Set<string>>(() => {
+    48→    if (typeof window === 'undefined') return new Set();
+    49→    try { return new Set(JSON.parse(localStorage.getItem('visited') || '[]')); } catch { return new Set(); }
+    50→  });
+    51→  const [geocodedCoords, setGeocodedCoords] = useState<Record<string, {lat:number;lng:number}>>(() => {
+    52→    if (typeof window === 'undefined') return {};
+    53→    try { return JSON.parse(localStorage.getItem('geocoded') || '{}'); } catch { return {}; }
+    54→  });
+    55→  const [route, setRoute] = useState<RouteStep[] | null>(null);
+    56→  const [routeIdx, setRouteIdx] = useState(0);
+    57→  const [activeCompany, setActiveCompany] = useState<Company | null>(null);
+    58→  const [topExpanded, setTopExpanded] = useState(false);
+    59→  const [activeTab, setActiveTab] = useState<TabView>('map');
+    60→  const [search, setSearch] = useState('');
+    61→  const [routeLoading, setRouteLoading] = useState(false);
+    62→  const [showFilters, setShowFilters] = useState(false);
+    63→  const [geocoding, setGeocoding] = useState(false);
+    64→  const [geoProgress, setGeoProgress] = useState({ done: 0, total: 0 });
+    65→
+    66→  // Load data
+    67→  useEffect(() => {
+    68→    fetch('/companies.json').then(r => r.json()).then((d: CompanyData) => setData(d));
+    69→  }, []);
+    70→
+    71→  // Persist state
+    72→  useEffect(() => { localStorage.setItem('visited', JSON.stringify([...visitedSlugs])); }, [visitedSlugs]);
+    73→  useEffect(() => { localStorage.setItem('selected', JSON.stringify([...selectedSlugs])); }, [selectedSlugs]);
+    74→  useEffect(() => { localStorage.setItem('geocoded', JSON.stringify(geocodedCoords)); }, [geocodedCoords]);
+    75→
+    76→  // Get effective coords (geocoded override or default)
+    77→  const getCoords = useCallback((c: Company): [number, number] => {
+    78→    if (geocodedCoords[c.slug]) return [geocodedCoords[c.slug].lng, geocodedCoords[c.slug].lat];
+    79→    if (c.has_real_coords) return [c.lng, c.lat];
+    80→    return [c.lng, c.lat]; // default fallback
+    81→  }, [geocodedCoords]);
+    82→
+    83→  // Filtered companies
+    84→  const filtered = data ? data.companies.filter(c => {
+    85→    if (selectedSectors.size > 0 && !selectedSectors.has(c.sector || '')) return false;
+    86→    if (search) {
+    87→      const q = search.toLowerCase();
+    88→      return c.name.toLowerCase().includes(q) || (c.address || '').toLowerCase().includes(q) || (c.sector || '').toLowerCase().includes(q);
+    89→    }
+    90→    return true;
+    91→  }) : [];
+    92→
+    93→  // Companies with mappable coords (real or geocoded)
+    94→  const mappable = filtered.filter(c => c.has_real_coords || geocodedCoords[c.slug]);
+    95→
+    96→  // Init Mapbox map
+    97→  useEffect(() => {
+    98→    if (!mapContainer.current || mapRef.current || !token) return;
+    99→    mapboxgl.accessToken = token;
+   100→    const map = new mapboxgl.Map({
+   101→      container: mapContainer.current,
+   102→      style: 'mapbox://styles/mapbox/dark-v11',
+   103→      center: MEKNES,
+   104→      zoom: 12,
+   105→      attributionControl: false,
+   106→    });
+   107→    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
+   108→    map.on('load', () => setMapLoaded(true));
+   109→    mapRef.current = map;
+   110→    return () => { map.remove(); mapRef.current = null; };
+   111→  }, [token]);
+   112→
+   113→  // Update markers
+   114→  useEffect(() => {
+   115→    if (!mapLoaded || !mapRef.current || !data) return;
+   116→    const map = mapRef.current;
+   117→
+   118→    // Clear old markers
+   119→    markersRef.current.forEach(m => m.remove());
+   120→    markersRef.current = [];
+   121→
+   122→    // Add markers for mappable companies
+   123→    mappable.forEach(company => {
+   124→      const [lng, lat] = getCoords(company);
+   125→      const isSelected = selectedSlugs.has(company.slug);
+   126→      const isVisited = visitedSlugs.has(company.slug);
+   127→      const color = getColor(company.sector);
+   128→      const size = isSelected ? 18 : isVisited ? 10 : 12;
+   129→      const bgColor = isVisited ? '#22c55e' : isSelected ? '#ef4444' : color;
+   130→
+   131→      const el = document.createElement('div');
+   132→      el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:${bgColor};border:2px solid rgba(255,255,255,0.9);box-shadow:0 2px 8px rgba(0,0,0,0.4);cursor:pointer;transition:transform 0.15s;`;
+   133→
+   134→      const marker = new mapboxgl.Marker({ element: el })
+   135→        .setLngLat([lng, lat])
+   136→        .addTo(map);
+   137→
+   138→      el.addEventListener('click', () => {
+   139→        setActiveCompany(company);
+   140→        setTopExpanded(false);
+   141→        map.flyTo({ center: [lng, lat], zoom: 16, duration: 600 });
+   142→      });
+   143→
+   144→      markersRef.current.push(marker);
+   145→    });
+   146→  }, [mapLoaded, mappable, selectedSlugs, visitedSlugs, data, geocodedCoords]);
+   147→
+   148→  // Fit bounds when first data loads
+   149→  useEffect(() => {
+   150→    if (!mapLoaded || !mapRef.current || !mappable.length) return;
+   151→    const bounds = new mapboxgl.LngLatBounds();
+   152→    mappable.forEach(c => { const [lng, lat] = getCoords(c); bounds.extend([lng, lat]); });
+   153→    mapRef.current.fitBounds(bounds, { padding: { top: 80, bottom: 200, left: 20, right: 20 }, duration: 800 });
+   154→  }, [mapLoaded, data, geocodedCoords]);
+   155→
+   156→  // Draw route on map
+   157→  useEffect(() => {
+   158→    if (!mapLoaded || !mapRef.current) return;
+   159→    const map = mapRef.current;
+   160→
+   161→    if (routeSourceRef.current) {
+   162→      if (map.getSource(routeSourceRef.current)) map.removeSource(routeSourceRef.current);
+   163→      if (map.getLayer(routeSourceRef.current)) map.removeLayer(routeSourceRef.current);
+   164→      routeSourceRef.current = null;
+   165→    }
+   166→
+   167→    if (!route || route.length < 2) return;
+   168→
+   169→    const coords: [number, number][] = route.map(s => {
+   170→      const [lng, lat] = getCoords(s.company);
+   171→      return [lng, lat];
+   172→    });
+   173→
+   174→    const srcId = 'route-line';
+   175→    routeSourceRef.current = srcId;
+   176→
+   177→    map.addSource(srcId, {
+   178→      type: 'geojson',
+   179→      data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } },
+   180→    });
+   181→    map.addLayer({
+   182→      id: srcId, type: 'line', source: srcId,
+   183→      layout: { 'line-join': 'round', 'line-cap': 'round' },
+   184→      paint: { 'line-color': '#3b82f6', 'line-width': 4, 'line-opacity': 0.8 },
+   185→    });
+   186→
+   187→    // Fit route bounds
+   188→    const bounds = new mapboxgl.LngLatBounds();
+   189→    coords.forEach(c => bounds.extend(c));
+   190→    map.fitBounds(bounds, { padding: { top: 80, bottom: 250, left: 20, right: 20 } });
+   191→
+   192→    // Try OSRM for real road path
+   193→    getOSRMRouteUrl(coords).then(url => {
+   194→      if (!url) return;
+   195→      fetch(url).then(r => r.json()).then(geojson => {
+   196→        if (geojson.routes?.[0]?.geometry && map.getSource(srcId)) {
+   197→          (map.getSource(srcId) as mapboxgl.GeoJSONSource).setData(geojson.routes[0].geometry);
+   198→        }
+   199→      }).catch(() => {});
+   200→    });
+   201→  }, [route, mapLoaded]);
+   202→
+   203→  // Geocoding function — calls Mapbox API directly from client
+   204→  const startGeocoding = async () => {
+   205→    if (!data || geocoding || !token) return;
+   206→    setGeocoding(true);
+   207→    const toGeocode = data.companies.filter(c => !c.has_real_coords && !geocodedCoords[c.slug] && c.address);
+   208→    setGeoProgress({ done: 0, total: toGeocode.length });
+   209→
+   210→    const BATCH = 5;
+   211→    for (let i = 0; i < toGeocode.length; i += BATCH) {
+   212→      const batch = toGeocode.slice(i, i + BATCH);
+   213→      const results: Record<string, { lat: number; lng: number } | null> = {};
+   214→      await Promise.all(batch.map(async (c) => {
+   215→        try {
+   216→          const q = `${c.address}${c.city ? `, ${c.city}` : ''}, Morocco`;
+   217→          const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json?access_token=${token}&country=ma&limit=1`;
+   218→          const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+   219→          const data = await resp.json();
+   220→          if (data.features?.[0]?.center) {
+   221→            results[c.slug] = { lng: data.features[0].center[0], lat: data.features[0].center[1] };
+   222→          } else { results[c.slug] = null; }
+   223→        } catch { results[c.slug] = null; }
+   224→      }));
+   225→      setGeocodedCoords(prev => {
+   226→        const next = { ...prev };
+   227→        for (const [slug, coords] of Object.entries(results)) { if (coords) next[slug] = coords; }
+   228→        return next;
+   229→      });
+   230→      setGeoProgress({ done: Math.min(i + BATCH, toGeocode.length), total: toGeocode.length });
+   231→      if (i + BATCH < toGeocode.length) await new Promise(r => setTimeout(r, 350));
+   232→    }
+   233→    setGeocoding(false);
+   234→  };
+   235→
+   236→  const toggleSector = (s: string) => setSelectedSectors(p => { const n = new Set(p); n.has(s) ? n.delete(s) : n.add(s); return n; });
+   237→  const toggleSelect = (slug: string) => { setSelectedSlugs(p => { const n = new Set(p); n.has(slug) ? n.delete(slug) : n.add(slug); return n; }); setRoute(null); };
+   238→  const selectAll = () => { setSelectedSlugs(new Set(mappable.map(c => c.slug))); setRoute(null); };
+   239→  const deselectAll = () => { setSelectedSlugs(new Set()); setRoute(null); };
+   240→  const markVisited = (slug: string) => setVisitedSlugs(p => new Set([...p, slug]));
+   241→  const markUnvisited = (slug: string) => setVisitedSlugs(p => { const n = new Set(p); n.delete(slug); return n; });
+   242→
+   243→  const doOptimize = useCallback(() => {
+   244→    if (selectedSlugs.size < 2) return;
+   245→    setRouteLoading(true);
+   246→    const sel = mappable.filter(c => selectedSlugs.has(c.slug));
+   247→    setTimeout(() => {
+   248→      const optimized = optimizeRoute(sel, 33.8730, -5.5407);
+   249→      setRoute(optimized);
+   250→      setRouteIdx(0);
+   251→      setRouteLoading(false);
+   252→      setActiveTab('map');
+   253→      if (optimized.length > 0) {
+   254→        const [lng, lat] = getCoords(optimized[0].company);
+   255→        setActiveCompany(optimized[0].company);
+   256→        mapRef.current?.flyTo({ center: [lng, lat], zoom: 16, duration: 600 });
+   257→      }
+   258→    }, 50);
+   259→  }, [selectedSlugs, mappable, geocodedCoords]);
+   260→
+   261→  const goNext = () => { if (!route || routeIdx >= route.length - 1) return; const i = routeIdx + 1; setRouteIdx(i); const c = route[i].company; setActiveCompany(c); const [lng, lat] = getCoords(c); mapRef.current?.flyTo({ center: [lng, lat], zoom: 17, duration: 400 }); };
+   262→  const goPrev = () => { if (!route || routeIdx <= 0) return; const i = routeIdx - 1; setRouteIdx(i); const c = route[i].company; setActiveCompany(c); const [lng, lat] = getCoords(c); mapRef.current?.flyTo({ center: [lng, lat], zoom: 17, duration: 400 }); };
+   263→  const navigateTo = (c: Company) => window.open(getGoogleMapsUrl(c.lat, c.lng, c.name, c.address), '_blank');
+   264→
+   265→  if (!data) return (
+   266→    <div className="h-dvh flex items-center justify-center bg-slate-950">
+   267→      <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
+   268→    </div>
+   269→  );
+   270→
+   271→  const cur = route ? route[routeIdx]?.company : activeCompany;
+   272→  const needGeo = data.stats.default_coords - Object.keys(geocodedCoords).length;
+   273→  const mapSelected = mappable.filter(c => selectedSlugs.has(c.slug));
+   274→
+   275→  return (
+   276→    <div className="flex flex-col bg-slate-950 overflow-hidden" style={{ height: '100dvh', width: '100vw' }}>
+   277→      {/* MAP */}
+   278→      <div className="flex-1 relative">
+   279→        <div ref={mapContainer} className="absolute inset-0" />
+   280→
+   281→        {/* SEARCH BAR (when no company active) */}
+   282→        {(!activeCompany && !route) && (
+   283→          <div className="absolute top-0 left-0 right-0 z-10 p-3" style={{animation:'fade-in 0.2s'}}>
+   284→            <div className="flex items-center gap-2 bg-slate-900/90 backdrop-blur-xl rounded-2xl px-4 h-12 border border-slate-700/50">
+   285→              <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+   286→              <input type="text" placeholder="Search companies, sectors, addresses..." className="flex-1 bg-transparent text-sm text-white placeholder-slate-400 outline-none min-w-0" value={search} onChange={e => setSearch(e.target.value)} />
+   287→              {search ? <button onClick={() => setSearch('')} className="w-6 h-6 rounded-full bg-slate-700 flex items-center justify-center"><svg className="w-3 h-3 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg></button>
+   288→              : <button onClick={() => setShowFilters(!showFilters)} className={`w-8 h-8 rounded-lg flex items-center justify-center ${showFilters ? 'bg-blue-600' : 'bg-slate-800'}`}><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/></svg></button>}
+   289→            </div>
+   290→
+   291→            {/* GEOCODE BANNER */}
+   292→            {needGeo > 0 && (
+   293→              <div className="mt-2 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl">
+   294→                <div className="flex items-center justify-between">
+   295→                  <div>
+   296→                    <p className="text-xs font-semibold text-amber-400">{needGeo} companies need geocoding</p>
+   297→                    <p className="text-[10px] text-amber-500/70">Addresses exist but map coordinates are missing</p>
+   298→                  </div>
+   299→                  <button onClick={startGeocoding} disabled={geocoding}
+   300→                    className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500 text-black disabled:opacity-50 active:scale-95 transition-transform">
+   301→                    {geocoding ? `${Math.round(geoProgress.done/geoProgress.total*100)}%` : 'Geocode All'}
+   302→                  </button>
+   303→                </div>
+   304→                {geocoding && <div className="mt-2 h-1 bg-slate-800 rounded-full overflow-hidden"><div className="h-full bg-amber-500 rounded-full transition-all" style={{width:`${(geoProgress.done/geoProgress.total)*100}%`}}/></div>}
+   305→              </div>
+   306→            )}
+   307→
+   308→            {/* FILTER CHIPS */}
+   309→            {showFilters && (
+   310→              <div className="mt-2 p-3 bg-slate-900/90 backdrop-blur-xl rounded-2xl border border-slate-700/50" style={{animation:'fade-in 0.15s'}}>
+   311→                <div className="flex items-center justify-between mb-2">
+   312→                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sectors</p>
+   313→                  <div className="flex gap-1">
+   314→                    <button onClick={() => setSelectedSectors(new Set(data.sectors))} className="text-[10px] text-blue-400 font-medium px-2 py-0.5">All</button>
+   315→                    <button onClick={() => setSelectedSectors(new Set())} className="text-[10px] text-slate-400 font-medium px-2 py-0.5">None</button>
+   316→                  </div>
+   317→                </div>
+   318→                <div className="flex flex-wrap gap-1.5">
+   319→                  {data.sectors.map(s => (
+   320→                    <button key={s} onClick={() => toggleSector(s)} className="text-[11px] px-3 py-1.5 rounded-full border transition-all active:scale-95"
+   321→                      style={{ borderColor: selectedSectors.has(s) ? getColor(s) : '#334155', background: selectedSectors.has(s) ? getColor(s)+'20' : 'transparent', color: selectedSectors.has(s) ? getColor(s) : '#64748b', fontWeight: selectedSectors.has(s) ? 600 : 400 }}>
+   322→                      {s}
+   323→                    </button>
+   324→                  ))}
+   325→                </div>
+   326→                <p className="text-[10px] text-slate-500 mt-2">{filtered.length} of {data.companies.length} companies · {mappable.length} on map</p>
+   327→              </div>
+   328→            )}
+   329→          </div>
+   330→        )}
+   331→
+   332→        {/* TOP SHEET — Company Info */}
+   333→        {cur && (
+   334→          <div className="absolute top-0 left-0 right-0 z-10" style={{animation:'slide-up 0.3s ease'}}>
+   335→            <div className="flex justify-center pt-2 pb-1 cursor-pointer" onClick={() => setTopExpanded(!topExpanded)}>
+   336→              <div className="w-10 h-1 rounded-full bg-slate-600" />
+   337→            </div>
+   338→            <div className="mx-2 rounded-2xl overflow-hidden border border-slate-700/50" style={{ maxHeight: topExpanded ? '70dvh' : 'auto', background: 'rgba(15,23,42,0.95)', backdropFilter: 'blur(20px)', transition: 'max-height 0.35s cubic-bezier(0.32,0.72,0,1)' }}>
+   339→              {/* Header */}
+   340→              <div className="flex items-center gap-3 p-3 cursor-pointer" onClick={() => setTopExpanded(!topExpanded)}>
+   341→                <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{background:getColor(cur.sector)+'20'}}>
+   342→                  <svg className="w-5 h-5" style={{color:getColor(cur.sector)}} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+   343→                </div>
+   344→                <div className="flex-1 min-w-0">
+   345→                  <p className="text-sm font-semibold text-white truncate">{cur.name}</p>
+   346→                  <p className="text-xs text-slate-400 truncate">{cur.address || cur.sector || ''}</p>
+   347→                </div>
+   348→                <div className="flex items-center gap-1.5 flex-shrink-0">
+   349→                  {route && <span className="text-xs font-bold text-blue-400 bg-blue-500/20 px-2 py-0.5 rounded-md">{routeIdx+1}/{route.length}</span>}
+   350→                  {topExpanded ? <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg> : <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7"/></svg>}
+   351→                </div>
+   352→              </div>
+   353→
+   354→              {/* Expanded details */}
+   355→              {topExpanded && (
+   356→                <div className="px-4 pb-4 space-y-3" style={{animation:'fade-in 0.2s'}}>
+   357→                  <div className="h-px bg-slate-800" />
+   358→                  <div className="flex flex-wrap gap-1.5">
+   359→                    {cur.sector && <span className="text-[10px] px-2 py-0.5 rounded-full border font-medium" style={{borderColor:getColor(cur.sector),color:getColor(cur.sector)}}>{cur.sector}</span>}
+   360→                    {cur.category && <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">{cur.category}</span>}
+   361→                    {cur.status && <span className="text-[10px] px-2 py-0.5 rounded-full bg-green-500/20 text-green-400">{cur.status}</span>}
+   362→                    {!cur.has_real_coords && !geocodedCoords[cur.slug] && <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400">⚠ No exact coords</span>}
+   363→                  </div>
+   364→                  <div className="grid grid-cols-2 gap-2">
+   365→                    {cur.ice && <div className="bg-slate-800/50 rounded-xl p-2.5"><p className="text-[10px] text-slate-500 uppercase font-medium">ICE</p><p className="text-xs font-mono text-slate-300 mt-0.5">{cur.ice}</p></div>}
+   366→                    {cur.rc && <div className="bg-slate-800/50 rounded-xl p-2.5"><p className="text-[10px] text-slate-500 uppercase font-medium">Reg. Commerce</p><p className="text-xs font-mono text-slate-300 mt-0.5">{cur.rc}</p></div>}
+   367→                    {cur.employees && <div className="bg-slate-800/50 rounded-xl p-2.5"><p className="text-[10px] text-slate-500 uppercase font-medium">Effectif</p><p className="text-xs text-slate-300 mt-0.5">{cur.employees}</p></div>}
+   368→                    {cur.date_creation && <div className="bg-slate-800/50 rounded-xl p-2.5"><p className="text-[10px] text-slate-500 uppercase font-medium">Created</p><p className="text-xs text-slate-300 mt-0.5">{cur.date_creation}</p></div>}
+   369→                  </div>
+   370→                  {cur.description && <div><p className="text-[10px] text-slate-500 uppercase font-medium mb-1">Description</p><p className="text-xs text-slate-400 leading-relaxed">{cur.description}</p></div>}
+   371→                  {(cur.phone1 || cur.phone2) && <div className="flex gap-2 flex-wrap">{[cur.phone1, cur.phone2, cur.phone3].filter(Boolean).map((p,i) => <a key={i} href={`tel:${p}`} className="text-xs text-blue-400 underline">{p}</a>)}</div>}
+   372→                  {route && <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-3 flex justify-between"><div><p className="text-[10px] text-blue-400">From prev</p><p className="text-sm font-bold text-blue-300">{formatDistance(route[routeIdx].distanceFromPrev)} · {formatDuration(route[routeIdx].distanceFromPrev)}</p></div><div className="text-right"><p className="text-[10px] text-blue-400">Total</p><p className="text-sm font-bold text-blue-300">{formatDistance(route[routeIdx].cumulativeDist)}</p></div></div>}
+   373→                  <div className="flex gap-2">
+   374→                    <button onClick={() => navigateTo(cur)} className="flex-1 h-11 rounded-xl bg-green-600 active:bg-green-700 text-white text-sm font-semibold flex items-center justify-center gap-1.5"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>Google Maps</button>
+   375→                    <button onClick={() => visitedSlugs.has(cur.slug) ? markUnvisited(cur.slug) : markVisited(cur.slug)} className={`h-11 w-11 rounded-xl flex items-center justify-center border ${visitedSlugs.has(cur.slug) ? 'bg-green-500/20 border-green-500/50 text-green-400' : 'bg-slate-800 border-slate-700 text-slate-400'}`}><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7"/></svg></button>
+   376→                    <button onClick={() => toggleSelect(cur.slug)} className={`h-11 w-11 rounded-xl flex items-center justify-center border ${selectedSlugs.has(cur.slug) ? 'bg-blue-500/20 border-blue-500/50 text-blue-400' : 'bg-slate-800 border-slate-700 text-slate-400'}`}><svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/></svg></button>
+   377→                  </div>
+   378→                </div>
+   379→              )}
+   380→            </div>
+   381→          </div>
+   382→        )}
+   383→
+   384→        {/* GENERATE ROUTE FAB */}
+   385→        {selectedSlugs.size > 0 && !route && (
+   386→          <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-10" style={{animation:'slide-up 0.3s'}}>
+   387→            <div className="flex items-center gap-2 bg-slate-900/95 backdrop-blur-xl rounded-2xl shadow-2xl px-3 py-2.5 border border-slate-700/50">
+   388→              <div className="w-8 h-8 rounded-xl bg-blue-600 flex items-center justify-center"><span className="text-white text-xs font-bold">{selectedSlugs.size}</span></div>
+   389→              <button onClick={doOptimize} disabled={selectedSlugs.size < 2 || routeLoading}
+   390→                className="h-10 rounded-xl bg-blue-600 active:bg-blue-700 text-white text-sm font-semibold px-4 disabled:opacity-40 flex items-center gap-1.5">
+   391→                {routeLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full" style={{animation:'spin-slow 0.8s linear infinite'}}/> : <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>}
+   392→                Generate Route
+   393→              </button>
+   394→              <button onClick={deselectAll} className="w-8 h-8 rounded-xl bg-slate-800 flex items-center justify-center"><svg className="w-4 h-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg></button>
+   395→            </div>
+   396→          </div>
+   397→        )}
+   398→
+   399→        {/* ROUTE NAV BAR (Waze bottom bar) */}
+   400→        {route && route.length > 0 && (
+   401→          <div className="absolute bottom-20 left-2 right-2 z-10" style={{animation:'slide-up 0.3s'}}>
+   402→            <div className="bg-slate-900/95 backdrop-blur-xl rounded-2xl border border-slate-700/50 p-3 shadow-2xl">
+   403→              <div className="h-1 bg-slate-800 rounded-full mb-3 overflow-hidden"><div className="h-full bg-blue-500 rounded-full transition-all" style={{width:`${((routeIdx+1)/route.length)*100}%`}}/></div>
+   404→              <div className="flex items-center gap-2">
+   405→                <button onClick={goPrev} disabled={routeIdx<=0} className="w-12 h-12 rounded-xl bg-slate-800 flex items-center justify-center flex-shrink-0 disabled:opacity-30 active:scale-95 transition-transform"><svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg></button>
+   406→                <button onClick={() => { setActiveCompany(route[routeIdx].company); setTopExpanded(!topExpanded); }} className="flex-1 min-w-0 text-left bg-slate-800 rounded-xl p-2.5 active:bg-slate-700 transition-colors">
+   407→                  <div className="flex items-center gap-2">
+   408→                    <div className="w-7 h-7 rounded-lg bg-blue-600 flex items-center justify-center flex-shrink-0"><span className="text-white text-xs font-bold">{routeIdx+1}</span></div>
+   409→                    <div className="min-w-0 flex-1"><p className="text-sm font-semibold text-white truncate">{route[routeIdx].company.name}</p><p className="text-[10px] text-slate-400 truncate">{route[routeIdx].company.address || route[routeIdx].company.sector}</p></div>
+   410→                  </div>
+   411→                  <div className="flex items-center gap-3 mt-1.5 ml-9">
+   412→                    <span className="text-[10px] text-slate-500">+{formatDistance(route[routeIdx].distanceFromPrev)}</span>
+   413→                    <span className="text-[10px] text-slate-500">{formatDuration(route[routeIdx].distanceFromPrev)}</span>
+   414→                    <span className="text-[10px] text-blue-400">Total: {formatDistance(route[routeIdx].cumulativeDist)}</span>
+   415→                  </div>
+   416→                </button>
+   417→                <button onClick={goNext} disabled={routeIdx>=route.length-1} className="w-12 h-12 rounded-xl bg-blue-600 flex items-center justify-center flex-shrink-0 disabled:opacity-30 disabled:bg-slate-800 active:scale-95 transition-transform"><svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/></svg></button>
+   418→              </div>
+   419→              <div className="flex gap-2 mt-3">
+   420→                <button onClick={() => navigateTo(route[routeIdx].company)} className="flex-1 h-11 rounded-xl bg-green-600 active:bg-green-700 text-white text-sm font-semibold flex items-center justify-center gap-1.5"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>Navigate</button>
+   421→                <button onClick={() => visitedSlugs.has(route[routeIdx].company.slug) ? markUnvisited(route[routeIdx].company.slug) : markVisited(route[routeIdx].company.slug)} className={`h-11 rounded-xl px-4 text-xs font-medium ${visitedSlugs.has(route[routeIdx].company.slug) ? 'bg-green-500/20 text-green-400' : 'bg-slate-800 text-slate-400'}`}>{visitedSlugs.has(route[routeIdx].company.slug) ? '✓ Done' : 'Mark'}</button>
+   422→                <button onClick={() => { setRoute(null); setRouteIdx(0); }} className="h-11 w-11 rounded-xl bg-slate-800 flex items-center justify-center text-red-400"><svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg></button>
+   423→              </div>
+   424→            </div>
+   425→          </div>
+   426→        )}
+   427→      </div>
+   428→
+   429→      {/* BOTTOM TAB BAR */}
+   430→      <div className="flex-shrink-0 bg-slate-900 border-t border-slate-800 z-20" style={{paddingBottom:'env(safe-area-inset-bottom,0px)'}}>
+   431→        <div className="flex items-center justify-around h-14">
+   432→          {(['map','list','route'] as TabView[]).map(tab => (
+   433→            <button key={tab} onClick={() => setActiveTab(tab)} className={`flex flex-col items-center justify-center gap-0.5 w-16 h-full transition-colors ${activeTab===tab ? 'text-blue-400' : 'text-slate-500'}`}>
+   434→              {tab === 'map' && <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>}
+   435→              {tab === 'list' && <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>}
+   436→              {tab === 'route' && <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/></svg>}
+   437→              <span className="text-[10px] font-medium capitalize">{tab}</span>
+   438→              <div className={`w-5 h-0.5 rounded-full bg-blue-400 transition-transform ${activeTab===tab ? 'scale-x-100' : 'scale-x-0'}`} />
+   439→              {tab === 'route' && selectedSlugs.size > 0 && !route && <div className="absolute top-1.5 right-2 w-4 h-4 bg-red-500 rounded-full flex items-center justify-center"><span className="text-[8px] text-white font-bold">{selectedSlugs.size > 99 ? '99+' : selectedSlugs.size}</span></div>}
+   440→            </button>
+   441→          ))}
+   442→        </div>
+   443→      </div>
+   444→
+   445→      {/* LIST VIEW OVERLAY */}
+   446→      {activeTab === 'list' && (
+   447→        <div className="absolute inset-0 z-30 bg-slate-950 flex flex-col" style={{paddingBottom:'calc(56px + env(safe-area-inset-bottom,0px))'}}>
+   448→          <div className="flex-shrink-0 px-4 pt-3 pb-2">
+   449→            <div className="flex items-center justify-between mb-2">
+   450→              <div><h2 className="text-lg font-bold text-white">Companies</h2><p className="text-xs text-slate-500">{filtered.length} results · {mappable.length} on map</p></div>
+   451→              <div className="flex gap-1.5"><button onClick={selectAll} className="text-xs text-blue-400 font-medium px-3 py-1.5 rounded-lg bg-blue-500/10">All</button><button onClick={deselectAll} className="text-xs text-slate-400 font-medium px-3 py-1.5 rounded-lg bg-slate-800">Clear</button></div>
+   452→            </div>
+   453→            <div className="flex items-center gap-2 bg-slate-900 rounded-xl px-3 h-10 border border-slate-800"><svg className="w-4 h-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg><input type="text" placeholder="Search..." className="flex-1 bg-transparent text-sm text-white outline-none" value={search} onChange={e => setSearch(e.target.value)} /></div>
+   454→            <div className="flex gap-1.5 mt-2 overflow-x-auto mobile-scroll pb-1">
+   455→              <button onClick={() => setSelectedSectors(new Set())} className={`text-[10px] px-2.5 py-1 rounded-full border whitespace-nowrap flex-shrink-0 ${selectedSectors.size===0 ? 'bg-white text-slate-900 border-white' : 'border-slate-700 text-slate-500'}`}>All</button>
+   456→              {data.sectors.map(s => <button key={s} onClick={() => toggleSector(s)} className="text-[10px] px-2.5 py-1 rounded-full border whitespace-nowrap flex-shrink-0" style={selectedSectors.has(s) ? {borderColor:getColor(s),background:getColor(s)+'20',color:getColor(s),fontWeight:600} : {borderColor:'#334155',color:'#64748b'}}>{s}</button>)}
+   457→            </div>
+   458→          </div>
+   459→          <div className="flex-1 overflow-y-auto mobile-scroll">
+   460→            {filtered.map(c => {
+   461→              const sel = selectedSlugs.has(c.slug), vis = visitedSlugs.has(c.slug), hasCoords = c.has_real_coords || geocodedCoords[c.slug];
+   462→              return (
+   463→                <div key={c.slug} onClick={() => { if(hasCoords){ setActiveCompany(c); setTopExpanded(false); setActiveTab('map'); const [lng,lat]=getCoords(c); mapRef.current?.flyTo({center:[lng,lat],zoom:17,duration:400}); } }}
+   464→                  className={`flex items-center gap-3 px-4 py-3 border-b border-slate-800/50 active:bg-slate-800/50 transition-colors ${vis?'opacity-50':''}`}>
+   465→                  <div className="w-1.5 h-10 rounded-full flex-shrink-0" style={{background:getColor(c.sector)}} />
+   466→                  <div className="flex-1 min-w-0">
+   467→                    <p className="text-sm font-medium text-white truncate">{c.name}</p>
+   468→                    <p className="text-xs text-slate-500 truncate">{c.address || c.sector || ''}</p>
+   469→                    <div className="flex items-center gap-2 mt-0.5">
+   470→                      {c.sector && <span className="text-[10px] text-slate-600">{c.sector}</span>}
+   471→                      {!hasCoords && <span className="text-[10px] text-amber-500">⚠ no coords</span>}
+   472→                    </div>
+   473→                  </div>
+   474→                  {vis && <svg className="w-4 h-4 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7"/></svg>}
+   475→                  <button onClick={e => { e.stopPropagation(); toggleSelect(c.slug); }} className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs flex-shrink-0 ${sel ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-500'}`}>{sel ? '✓' : '+'}</button>
+   476→                </div>
+   477→              );
+   478→            })}
+   479→          </div>
+   480→        </div>
+   481→      )}
+   482→
+   483→      {/* ROUTE VIEW OVERLAY */}
+   484→      {activeTab === 'route' && (
+   485→        <div className="absolute inset-0 z-30 bg-slate-950 flex flex-col" style={{paddingBottom:'calc(56px + env(safe-area-inset-bottom,0px))'}}>
+   486→          <div className="flex-shrink-0 px-4 pt-3 pb-3 border-b border-slate-800">
+   487→            <div className="flex items-center justify-between">
+   488→              <div><h2 className="text-lg font-bold text-white">Route Plan</h2>
+   489→                {route ? <div className="flex items-center gap-2 mt-0.5"><span className="text-xs text-slate-400">{route.length} stops</span><span className="text-xs text-slate-600">·</span><span className="text-xs text-slate-400">{formatDistance(route[route.length-1].cumulativeDist)}</span><span className="text-xs text-slate-600">·</span><span className="text-xs text-slate-400">{formatDuration(route[route.length-1].cumulativeDist)}</span></div>
+   490→                : <p className="text-xs text-slate-500 mt-0.5">{mapSelected.length} mappable companies selected</p>}
+   491→              </div>
+   492→              {route && <button onClick={() => { setRoute(null); setRouteIdx(0); }} className="text-xs text-red-400 font-medium px-3 py-1.5 rounded-lg bg-red-500/10">Clear</button>}
+   493→            </div>
+   494→            {!route && mapSelected.length >= 2 && <button onClick={doOptimize} disabled={routeLoading} className="w-full mt-3 h-12 rounded-xl bg-blue-600 active:bg-blue-700 text-white font-semibold text-sm flex items-center justify-center gap-2 disabled:opacity-40">{routeLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full" style={{animation:'spin-slow 0.8s linear infinite'}}/> : <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/></svg>}Optimize Route for {mapSelected.length} Companies</button>}
+   495→            {!route && mapSelected.length < 2 && <div className="mt-3 p-4 bg-slate-900 rounded-xl text-center"><p className="text-xs text-slate-500">Select 2+ companies with coordinates from the map or list, then optimize.</p>{needGeo > 0 && <p className="text-xs text-amber-500 mt-1">{needGeo} companies still need geocoding</p>}</div>}
+   496→          </div>
+   497→          {route && <div className="flex-1 overflow-y-auto mobile-scroll p-4 space-y-0">
+   498→            {route.map((step, idx) => { const vis = visitedSlugs.has(step.company.slug), isCur = idx===routeIdx; return (
+   499→              <div key={step.company.slug} onClick={() => { setRouteIdx(idx); setActiveCompany(step.company); setActiveTab('map'); const [lng,lat]=getCoords(step.company); mapRef.current?.flyTo({center:[lng,lat],zoom:17,duration:400}); }}
+   500→                className={`flex gap-3 p-3 rounded-xl cursor-pointer transition-all mb-0 ${isCur ? 'bg-blue-500/10 border border-blue-500/30' : 'border border-transparent active:bg-slate-800/50'} ${vis?'opacity-40':''}`}>
+   501→                <div className="flex flex-col items-center pt-0.5">
+   502→                  <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${vis ? 'bg-green-500 text-white' : isCur ? 'bg-blue-600 text-white ring-4 ring-blue-500/20' : 'bg-slate-800 text-slate-400'}`}>{vis ? '✓' : idx+1}</div>
+   503→                  {idx < route.length-1 && <div className={`w-0.5 flex-1 my-1 min-h-4 ${vis?'bg-green-500/30':'bg-slate-800'}`} />}
+   504→                </div>
+   505→                <div className="flex-1 min-w-0 pb-3">
+   506→                  <p className={`text-sm font-medium truncate ${isCur?'text-blue-400':'text-white'}`}>{step.company.name}</p>
+   507→                  <p className="text-xs text-slate-500 truncate mt-0.5">{step.company.address || step.company.sector}</p>
+   508→                  <div className="flex items-center gap-3 mt-1"><span className="text-[10px] text-slate-500">+{formatDistance(step.distanceFromPrev)}</span><span className="text-[10px] text-slate-600">({formatDistance(step.cumulativeDist)})</span></div>
+   509→                  <div className="flex gap-1.5 mt-2">
+   510→                    <button onClick={e => { e.stopPropagation(); navigateTo(step.company); }} className="text-[10px] font-medium px-3 py-1.5 rounded-lg bg-green-500/10 text-green-400 active:bg-green-500/20">Navigate</button>
+   511→                    <button onClick={e => { e.stopPropagation(); vis ? markUnvisited(step.company.slug) : markVisited(step.company.slug); }} className={`text-[10px] font-medium px-3 py-1.5 rounded-lg ${vis ? 'bg-slate-800 text-slate-400' : 'bg-blue-500/10 text-blue-400'}`}>{vis ? 'Undo' : 'Done'}</button>
+   512→                  </div>
+   513→                </div>
+   514→              </div>
+   515→            );})}
+   516→          </div>}
+   517→        </div>
+   518→      )}
+   519→    </div>
+   520→  );
+   521→}
