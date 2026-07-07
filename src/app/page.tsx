@@ -7,7 +7,7 @@ import { Company, CompanyData, TabView } from '@/lib/types';
 import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
 
 const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat]
-const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'; // Free, no API key needed
+const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'; // Free, no API key, light readable style
 
 // Debug logger — also renders on-screen
 const _dbgLines: string[] = [];
@@ -145,10 +145,13 @@ export default function Home() {
         });
         map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-left');
         map.on('load', () => {
-          dbg('MAP LOADED SUCCESSFULLY');
+          dbg('MAP LOADED SUCCESSFULLY — style: ' + MAP_STYLE);
+          const style = map.getStyle();
+          dbg('Active style sources: ' + Object.keys(style.sources || {}).join(', '));
           setMapLoaded(true);
         });
         map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
+        map.on('render', () => { if (!mapLoaded) dbg('First render complete'); });
         mapRef.current = map;
         dbg('Map instance created, waiting for load event...');
       } catch (err: unknown) {
