@@ -35,9 +35,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="apple-touch-icon" href="/icon-192.png" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
-        <script dangerouslySetInnerHTML={{
-          __html: `window.__MAPBOX_TOKEN__="${process.env.MAPBOX_TOKEN || ''}";console.log('[OPTIMAP-SRV] MAPBOX_TOKEN env at build=' + (typeof process !== 'undefined' && process.env.MAPBOX_TOKEN ? 'SET(' + process.env.MAPBOX_TOKEN.length + 'c)' : 'EMPTY'));`,
-        }} />
       </head>
       <body className={`${geistSans.variable} antialiased bg-slate-950 text-white`}>
         {children}

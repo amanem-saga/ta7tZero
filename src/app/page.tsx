@@ -1,12 +1,13 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import mapboxgl from 'mapbox-gl';
-import 'mapbox-gl/dist/mapbox-gl.css';
+import maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
 import { Company, CompanyData, TabView } from '@/lib/types';
 import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
 
-const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat] for Mapbox
+const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat]
+const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'; // Free, no API key needed
 
 // Debug logger — also renders on-screen
 const _dbgLines: string[] = [];
@@ -37,30 +38,13 @@ const getColor = (s: string | null) => SECTOR_COLORS[s || ''] || '#6b7280';
 
 export default function Home() {
   const mapContainer = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<mapboxgl.Map | null>(null);
-  const markersRef = useRef<mapboxgl.Marker[]>([]);
+  const mapRef = useRef<maplibregl.Map | null>(null);
+  const markersRef = useRef<maplibregl.Marker[]>([]);
   const routeSourceRef = useRef<string | null>(null);
 
   const [data, setData] = useState<CompanyData | null>(null);
-  const [token, setToken] = useState('');
   const [mapLoaded, setMapLoaded] = useState(false);
 
-  // Read token from server-injected global
-  useEffect(() => {
-    dbg('Mount: reading MAPBOX_TOKEN from window.__MAPBOX_TOKEN__...');
-    const t = (window as unknown as { __MAPBOX_TOKEN__?: string }).__MAPBOX_TOKEN__;
-    dbg('Token value: ' + (t ? t.slice(0, 8) + '...' + t.slice(-4) : 'EMPTY / UNDEFINED'));
-    if (t && t.length > 10) {
-      setToken(t);
-    } else {
-      dbg('Injected token empty/short — trying /api/token fallback...');
-      fetch('/api/token').then(r => r.json()).then(d => {
-        dbg('/api/token returned: ' + (d.token ? 'SET(' + d.token.length + ' chars)' : 'EMPTY'));
-        if (d.token) setToken(d.token);
-        else dbg('FATAL: No MAPBOX_TOKEN available from any source. Set it in Railway Variables tab.');
-      }).catch(err => dbg('ERROR fetching /api/token: ' + err.message));
-    }
-  }, []);
   const [selectedSectors, setSelectedSectors] = useState<Set<string>>(new Set());
   const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(() => {
     if (typeof window === 'undefined') return new Set();
@@ -131,39 +115,35 @@ export default function Home() {
   // Companies with mappable coords (real or geocoded)
   const mappable = filtered.filter(c => c.has_real_coords || geocodedCoords[c.slug]);
 
-  // Init Mapbox map — only when BOTH token and data are ready
+  // Init MapLibre map — no API key needed, only requires data to be loaded
   useEffect(() => {
-    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + 'c)' : 'EMPTY') + ' data=' + !!data);
-    if (!token || !data || mapRef.current) {
-      if (!token) dbg('WAITING: token not yet available');
+    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' data=' + !!data);
+    if (!data || mapRef.current) {
       if (!data) dbg('WAITING: data not yet loaded');
       if (mapRef.current) dbg('SKIP: map already initialized');
       return;
     }
-    // Wait 2 ticks so the main render's container div is painted (not the loading overlay's)
     const timer = setTimeout(() => {
       if (!mapContainer.current) {
         dbg('BLOCKED: mapContainer ref still null after delay');
         return;
       }
-      // Verify the container has actual dimensions
       const rect = mapContainer.current.getBoundingClientRect();
       dbg('Container dimensions: ' + Math.round(rect.width) + 'x' + Math.round(rect.height));
       if (rect.width === 0 || rect.height === 0) {
-        dbg('BLOCKED: container has zero dimensions — cannot init WebGL map');
+        dbg('BLOCKED: container has zero dimensions');
         return;
       }
       try {
-        mapboxgl.accessToken = token;
-        dbg('Creating Mapbox GL map with style dark-v11, center=' + MEKNES + ', zoom=12');
-        const map = new mapboxgl.Map({
+        dbg('Creating MapLibre GL map (CARTO dark-matter, no API key), center=' + MEKNES + ', zoom=12');
+        const map = new maplibregl.Map({
           container: mapContainer.current,
-          style: 'mapbox://styles/mapbox/dark-v11',
+          style: MAP_STYLE,
           center: MEKNES,
           zoom: 12,
           attributionControl: false,
         });
-        map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
+        map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-left');
         map.on('load', () => {
           dbg('MAP LOADED SUCCESSFULLY');
           setMapLoaded(true);
@@ -176,7 +156,7 @@ export default function Home() {
       }
     }, 200);
     return () => { clearTimeout(timer); mapRef.current?.remove(); mapRef.current = null; };
-  }, [token, data]);
+  }, [data]);
 
   // Update markers
   useEffect(() => {
@@ -200,7 +180,7 @@ export default function Home() {
       const el = document.createElement('div');
       el.style.cssText = `width:${size}px;height:${size}px;border-radius:50%;background:${bgColor};border:2px solid rgba(255,255,255,0.9);box-shadow:0 2px 8px rgba(0,0,0,0.4);cursor:pointer;transition:transform 0.15s;`;
 
-      const marker = new mapboxgl.Marker({ element: el })
+      const marker = new maplibregl.Marker({ element: el })
         .setLngLat([lng, lat])
         .addTo(map);
 
@@ -217,7 +197,7 @@ export default function Home() {
   // Fit bounds when first data loads
   useEffect(() => {
     if (!mapLoaded || !mapRef.current || !mappable.length) return;
-    const bounds = new mapboxgl.LngLatBounds();
+    const bounds = new maplibregl.LngLatBounds();
     mappable.forEach(c => { const [lng, lat] = getCoords(c); bounds.extend([lng, lat]); });
     mapRef.current.fitBounds(bounds, { padding: { top: 80, bottom: 200, left: 20, right: 20 }, duration: 800 });
   }, [mapLoaded, data, geocodedCoords]);
@@ -254,7 +234,7 @@ export default function Home() {
     });
 
     // Fit route bounds
-    const bounds = new mapboxgl.LngLatBounds();
+    const bounds = new maplibregl.LngLatBounds();
     coords.forEach(c => bounds.extend(c));
     map.fitBounds(bounds, { padding: { top: 80, bottom: 250, left: 20, right: 20 } });
 
@@ -263,31 +243,31 @@ export default function Home() {
       if (!url) return;
       fetch(url).then(r => r.json()).then(geojson => {
         if (geojson.routes?.[0]?.geometry && map.getSource(srcId)) {
-          (map.getSource(srcId) as mapboxgl.GeoJSONSource).setData(geojson.routes[0].geometry);
+          (map.getSource(srcId) as maplibregl.GeoJSONSource).setData(geojson.routes[0].geometry);
         }
       }).catch(() => {});
     });
   }, [route, mapLoaded]);
 
-  // Geocoding function — calls Mapbox API directly from client
+  // Geocoding function — uses Nominatim (OpenStreetMap, free, no API key)
   const startGeocoding = async () => {
-    if (!data || geocoding || !token) return;
+    if (!data || geocoding) return;
     setGeocoding(true);
     const toGeocode = data.companies.filter(c => !c.has_real_coords && !geocodedCoords[c.slug] && c.address);
     setGeoProgress({ done: 0, total: toGeocode.length });
 
-    const BATCH = 5;
+    const BATCH = 2; // Nominatim rate limit: 1 req/sec
     for (let i = 0; i < toGeocode.length; i += BATCH) {
       const batch = toGeocode.slice(i, i + BATCH);
       const results: Record<string, { lat: number; lng: number } | null> = {};
       await Promise.all(batch.map(async (c) => {
         try {
           const q = `${c.address}${c.city ? `, ${c.city}` : ''}, Morocco`;
-          const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json?access_token=${token}&country=ma&limit=1`;
-          const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+          const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&countrycodes=ma&limit=1`;
+          const resp = await fetch(url, { signal: AbortSignal.timeout(10000), headers: { 'User-Agent': 'Optimap/1.0' } });
           const data = await resp.json();
-          if (data.features?.[0]?.center) {
-            results[c.slug] = { lng: data.features[0].center[0], lat: data.features[0].center[1] };
+          if (data?.[0]?.lat && data?.[0]?.lon) {
+            results[c.slug] = { lng: parseFloat(data[0].lon), lat: parseFloat(data[0].lat) };
           } else { results[c.slug] = null; }
         } catch { results[c.slug] = null; }
       }));
@@ -297,7 +277,7 @@ export default function Home() {
         return next;
       });
       setGeoProgress({ done: Math.min(i + BATCH, toGeocode.length), total: toGeocode.length });
-      if (i + BATCH < toGeocode.length) await new Promise(r => setTimeout(r, 350));
+      if (i + BATCH < toGeocode.length) await new Promise(r => setTimeout(r, 1100)); // Nominatim: 1 req/sec
     }
     setGeocoding(false);
   };
@@ -365,7 +345,7 @@ export default function Home() {
             <span className="text-red-400 font-bold">OPTIMAP DEBUG LOG</span>
             <button onClick={() => { (window as unknown as Record<string, string[]>).__DBG = []; }} className="text-slate-500 text-[9px]">clear</button>
           </div>
-          <div className="text-slate-500 mb-1">token={token ? token.slice(0,6)+'...' : 'EMPTY'} | data={!!data} | mapLoaded={mapLoaded} | mappable={mappable.length}</div>
+          <div className="text-slate-500 mb-1">map=MapLibre+CARTO | data={!!data} | mapLoaded={mapLoaded} | mappable={mappable.length}</div>
           <pre className="whitespace-pre-wrap break-all">{dbgLines.join('\n')}</pre>
         </div>
       )}
