@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build output
+.next/
+
+# Python / scraper (not needed for the web app)
+optimus-scraper/
+venv/
+.venv/
+__pycache__/
+*.pyc
+scraper/
+db/
+data/
+upload/
+*.db
+
+# Git
+.git/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs & temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Skills (not needed for deployment)
+skills/
+
+# Misc
+CLAUDE.md
+AGENTS.md
+README.md
+bun.lock
