@@ -133,36 +133,42 @@ export default function Home() {
 
   // Init Mapbox map
   useEffect(() => {
-    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + ' chars)' : 'EMPTY'));
-    if (!mapContainer.current || mapRef.current || !token) {
+    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + ' chars)' : 'EMPTY') + ' data=' + !!data);
+    if (!token || mapRef.current) {
       if (!token) dbg('BLOCKED: token is empty — map cannot initialize. Set MAPBOX_TOKEN env var on Railway.');
-      if (!mapContainer.current) dbg('BLOCKED: mapContainer ref is null');
       return;
     }
-    try {
-      mapboxgl.accessToken = token;
-      dbg('Creating Mapbox GL map with style dark-v11, center=' + MEKNES + ', zoom=12');
-      const map = new mapboxgl.Map({
-        container: mapContainer.current,
-        style: 'mapbox://styles/mapbox/dark-v11',
-        center: MEKNES,
-        zoom: 12,
-        attributionControl: false,
-      });
-      map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
-      map.on('load', () => {
-        dbg('MAP LOADED SUCCESSFULLY');
-        setMapLoaded(true);
-      });
-      map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
-      map.on('styledata', () => { if (!mapLoaded) dbg('Style data loaded'); });
-      mapRef.current = map;
-      dbg('Map instance created, waiting for load event...');
-    } catch (err: unknown) {
-      dbg('EXCEPTION creating map: ' + (err instanceof Error ? err.message : String(err)));
-    }
-    return () => { mapRef.current?.remove(); mapRef.current = null; };
-  }, [token]);
+    // Wait a tick so the container div is actually in the DOM
+    const timer = setTimeout(() => {
+      if (!mapContainer.current) {
+        dbg('BLOCKED: mapContainer ref still null after tick');
+        return;
+      }
+      try {
+        mapboxgl.accessToken = token;
+        dbg('Creating Mapbox GL map with style dark-v11, center=' + MEKNES + ', zoom=12');
+        const map = new mapboxgl.Map({
+          container: mapContainer.current,
+          style: 'mapbox://styles/mapbox/dark-v11',
+          center: MEKNES,
+          zoom: 12,
+          attributionControl: false,
+        });
+        map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
+        map.on('load', () => {
+          dbg('MAP LOADED SUCCESSFULLY');
+          setMapLoaded(true);
+        });
+        map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
+        map.on('styledata', () => { if (!mapLoaded) dbg('Style data loaded'); });
+        mapRef.current = map;
+        dbg('Map instance created, waiting for load event...');
+      } catch (err: unknown) {
+        dbg('EXCEPTION creating map: ' + (err instanceof Error ? err.message : String(err)));
+      }
+    }, 100);
+    return () => { clearTimeout(timer); mapRef.current?.remove(); mapRef.current = null; };
+  }, [token, data]); // data dependency: container div only exists after data loads
 
   // Update markers
   useEffect(() => {
@@ -328,9 +334,13 @@ export default function Home() {
     return () => clearInterval(iv);
   }, []);
 
+  // Loading overlay — map container is ALWAYS rendered below
   if (!data) return (
-    <div className="h-dvh flex items-center justify-center bg-slate-950">
-      <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
+    <div className="h-dvh flex flex-col bg-slate-950 overflow-hidden">
+      <div ref={mapContainer} className="flex-1 relative" />
+      <div className="absolute inset-0 flex items-center justify-center bg-slate-950 z-20">
+        <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
+      </div>
     </div>
   );
 
