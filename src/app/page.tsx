@@ -6,18 +6,24 @@ import { Company, CompanyData, TabView } from '@/lib/types';
 import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
 
 const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat]
+
 // Inline style — no external fetch, no CORS issues, works everywhere
+// Primary: CARTO Voyager (fast CDN, no key), Fallback: OSM tiles
 const MAP_STYLE = {
   version: 8 as const,
   sources: {
-    osm: {
+    carto: {
       type: 'raster' as const,
-      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+      tiles: [
+        'https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
+        'https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
+        'https://c.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png',
+      ],
       tileSize: 256,
-      attribution: '© OpenStreetMap',
+      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
     },
   },
-  layers: [{ id: 'osm', type: 'raster' as const, source: 'osm' }],
+  layers: [{ id: 'carto', type: 'raster' as const, source: 'carto' }],
 };
 
 // Debug logger — also renders on-screen
@@ -126,6 +132,9 @@ export default function Home() {
   // Companies with mappable coords (real or geocoded)
   const mappable = filtered.filter(c => c.has_real_coords || geocodedCoords[c.slug]);
 
+  // WebGL support check
+  const [webglError, setWebglError] = useState<string | null>(null);
+
   // Init MapLibre map — no API key needed, only requires data to be loaded
   useEffect(() => {
     dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' data=' + !!data);
@@ -145,28 +154,97 @@ export default function Home() {
         dbg('BLOCKED: container has zero dimensions');
         return;
       }
+
+      // Check WebGL support BEFORE creating the map
+      const testCanvas = document.createElement('canvas');
+      const gl = testCanvas.getContext('webgl') || testCanvas.getContext('experimental-webgl');
+      if (!gl) {
+        const gl2 = testCanvas.getContext('webgl2');
+        if (!gl2) {
+          dbg('FATAL: WebGL is NOT available in this browser');
+          setWebglError('WebGL is disabled or not supported. Please enable WebGL in your browser settings (chrome://flags or about:config) and reload.');
+          return;
+        }
+      }
+      dbg('WebGL check passed');
+
       try {
-        dbg('Creating MapLibre GL map (OSM raster tiles, inline style), center=' + MEKNES + ', zoom=12');
+        dbg('Creating MapLibre GL map (CARTO Voyager raster tiles), center=' + MEKNES + ', zoom=12');
         const map = new maplibregl.Map({
           container: mapContainer.current,
           style: MAP_STYLE,
           center: MEKNES,
           zoom: 12,
           attributionControl: false,
+          crossSourceCollisions: false,
+          fadeDuration: 0,
         });
         map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'bottom-left');
+
+        let renderCount = 0;
+        map.on('render', () => {
+          renderCount++;
+          if (renderCount <= 3) dbg('Render #' + renderCount);
+        });
+
         map.on('load', () => {
-          dbg('MAP LOADED SUCCESSFULLY — OSM raster tiles');
+          dbg('MAP LOADED SUCCESSFULLY — CARTO Voyager raster tiles');
           const style = map.getStyle();
           dbg('Active style sources: ' + Object.keys(style.sources || {}).join(', '));
+
+          // Check canvas pixel data after load
+          setTimeout(() => {
+            const canvas = mapContainer.current?.querySelector('canvas');
+            if (canvas) {
+              const cRect = canvas.getBoundingClientRect();
+              dbg('Canvas element: ' + Math.round(cRect.width) + 'x' + Math.round(cRect.height) +
+                ' | display: ' + getComputedStyle(canvas).display +
+                ' | opacity: ' + getComputedStyle(canvas).opacity +
+                ' | visibility: ' + getComputedStyle(canvas).visibility);
+              try {
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                  const pixel = ctx.getImageData(Math.floor(cRect.width / 2), Math.floor(cRect.height / 2), 1, 1).data;
+                  dbg('Center pixel RGBA: [' + pixel[0] + ',' + pixel[1] + ',' + pixel[2] + ',' + pixel[3] + ']');
+                  if (pixel[0] === 0 && pixel[1] === 0 && pixel[2] === 0) {
+                    dbg('WARNING: Center pixel is BLACK — tiles may not be rendering!');
+                  } else {
+                    dbg('TILES CONFIRMED VISIBLE (non-black pixel detected)');
+                  }
+                }
+              } catch (pe) {
+                dbg('Pixel check failed: ' + (pe instanceof Error ? pe.message : String(pe)));
+              }
+            } else {
+              dbg('WARNING: No canvas element found inside map container!');
+            }
+          }, 2000);
+
           setMapLoaded(true);
         });
+
+        // Monitor tile loading
+        map.on('sourcedata', (e) => {
+          if (e.isSourceLoaded && e.sourceId === 'carto') {
+            dbg('Source "carto" data loaded (tiles fetched)');
+          }
+        });
+        map.on('data', (e) => {
+          if (e.sourceId === 'carto' && e.isSourceLoaded) {
+            dbg('Data event: carto source loaded, dataType=' + e.dataType);
+          }
+        });
+
         map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
-        map.on('render', () => { if (!mapLoaded) dbg('First render complete'); });
+        map.on('webglcontextlost', () => { dbg('FATAL: WebGL context LOST'); });
         mapRef.current = map;
         dbg('Map instance created, waiting for load event...');
       } catch (err: unknown) {
-        dbg('EXCEPTION creating map: ' + (err instanceof Error ? err.message : String(err)));
+        const msg = err instanceof Error ? err.message : String(err);
+        dbg('EXCEPTION creating map: ' + msg);
+        if (msg.includes('WebGL') || msg.includes('webgl')) {
+          setWebglError('WebGL initialization failed: ' + msg + '. Try enabling WebGL in browser settings.');
+        }
       }
     }, 200);
     return () => { clearTimeout(timer); mapRef.current?.remove(); mapRef.current = null; };
@@ -346,6 +424,20 @@ export default function Home() {
   const cur = route ? route[routeIdx]?.company : activeCompany;
   const needGeo = data.stats.default_coords - Object.keys(geocodedCoords).length;
   const mapSelected = mappable.filter(c => selectedSlugs.has(c.slug));
+
+  // WebGL error screen
+  if (webglError) return (
+    <div className="h-dvh flex items-center justify-center bg-slate-950 p-6">
+      <div className="text-center max-w-sm">
+        <div className="w-16 h-16 rounded-full bg-red-500/20 flex items-center justify-center mx-auto mb-4">
+          <svg className="w-8 h-8 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/></svg>
+        </div>
+        <h2 className="text-white text-lg font-semibold mb-2">WebGL Not Available</h2>
+        <p className="text-slate-400 text-sm leading-relaxed mb-4">{webglError}</p>
+        <p className="text-slate-500 text-xs">The map requires WebGL to render tiles. This is usually caused by browser extensions disabling hardware acceleration, or outdated GPU drivers.</p>
+      </div>
+    </div>
+  );
 
   return (
     <div className="flex flex-col bg-slate-950 overflow-hidden" style={{ height: '100dvh', width: '100vw' }}>

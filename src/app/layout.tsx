@@ -35,8 +35,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="apple-touch-icon" href="/icon-192.png" />
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
-        {/* MapLibre GL CSS — hardlinked to bypass any SW/cache issues */}
-        <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
+        {/* MapLibre GL CSS — local copy, no external CDN dependency */}
+        <link rel="stylesheet" href="/maplibre-gl.css" />
       </head>
       <body className={`${geistSans.variable} antialiased bg-slate-950 text-white`}>
         {children}
