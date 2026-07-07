@@ -7,6 +7,17 @@ import { Company, CompanyData, TabView } from '@/lib/types';
 import { optimizeRoute, formatDistance, formatDuration, getGoogleMapsUrl, getOSRMRouteUrl, RouteStep } from '@/lib/route';
 
 const MEKNES: [number, number] = [-5.5407, 33.8730]; // [lng, lat] for Mapbox
+
+// Debug logger — also renders on-screen
+const _dbgLines: string[] = [];
+if (typeof window !== 'undefined') { (window as unknown as Record<string, string[]>).__DBG = (window as unknown as Record<string, string[]>).__DBG || []; }
+const dbg = (msg: string) => {
+  const ts = new Date().toISOString().slice(11, 23);
+  const line = `[${ts}] ${msg}`;
+  console.log('%c[OPTIMAP] ' + msg, 'color:#3b82f6;font-weight:bold');
+  if (typeof window !== 'undefined') { (window as unknown as Record<string, string[]>).__DBG.push(line); }
+};
+
 const SECTOR_COLORS: Record<string, string> = {
   'Commerce & Négoce': '#ef4444',
   'Bâtiment & Travaux Publics': '#f59e0b',
@@ -36,8 +47,19 @@ export default function Home() {
 
   // Read token from server-injected global
   useEffect(() => {
+    dbg('Mount: reading MAPBOX_TOKEN from window.__MAPBOX_TOKEN__...');
     const t = (window as unknown as { __MAPBOX_TOKEN__?: string }).__MAPBOX_TOKEN__;
-    if (t) setToken(t);
+    dbg('Token value: ' + (t ? t.slice(0, 8) + '...' + t.slice(-4) : 'EMPTY / UNDEFINED'));
+    if (t && t.length > 10) {
+      setToken(t);
+    } else {
+      dbg('Injected token empty/short — trying /api/token fallback...');
+      fetch('/api/token').then(r => r.json()).then(d => {
+        dbg('/api/token returned: ' + (d.token ? 'SET(' + d.token.length + ' chars)' : 'EMPTY'));
+        if (d.token) setToken(d.token);
+        else dbg('FATAL: No MAPBOX_TOKEN available from any source. Set it in Railway Variables tab.');
+      }).catch(err => dbg('ERROR fetching /api/token: ' + err.message));
+    }
   }, []);
   const [selectedSectors, setSelectedSectors] = useState<Set<string>>(new Set());
   const [selectedSlugs, setSelectedSlugs] = useState<Set<string>>(() => {
@@ -65,7 +87,23 @@ export default function Home() {
 
   // Load data
   useEffect(() => {
-    fetch('/companies.json').then(r => r.json()).then((d: CompanyData) => setData(d));
+    dbg('Fetching /companies.json ...');
+    fetch('/companies.json')
+      .then(r => {
+        dbg('Response status: ' + r.status + ' ' + r.statusText);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then((d: CompanyData) => {
+        dbg('Loaded ' + d.companies.length + ' companies, ' + (d.sectors?.length || 0) + ' sectors');
+        if (d.stats) dbg('Stats: real_coords=' + d.stats.real_coords + ' default_coords=' + d.stats.default_coords);
+        // Log first 3 companies for coord check
+        d.companies.slice(0, 3).forEach((c, i) => {
+          dbg('Company[' + i + ']: ' + c.name + ' | lat=' + c.lat + ' lng=' + c.lng + ' has_real=' + c.has_real_coords + ' | ' + (c.address || 'no address'));
+        });
+        setData(d);
+      })
+      .catch(err => { dbg('ERROR loading companies.json: ' + err.message); });
   }, []);
 
   // Persist state
@@ -95,19 +133,35 @@ export default function Home() {
 
   // Init Mapbox map
   useEffect(() => {
-    if (!mapContainer.current || mapRef.current || !token) return;
-    mapboxgl.accessToken = token;
-    const map = new mapboxgl.Map({
-      container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/dark-v11',
-      center: MEKNES,
-      zoom: 12,
-      attributionControl: false,
-    });
-    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
-    map.on('load', () => setMapLoaded(true));
-    mapRef.current = map;
-    return () => { map.remove(); mapRef.current = null; };
+    dbg('Map init effect fired. container=' + !!mapContainer.current + ' existing=' + !!mapRef.current + ' token=' + (token ? 'SET(' + token.length + ' chars)' : 'EMPTY'));
+    if (!mapContainer.current || mapRef.current || !token) {
+      if (!token) dbg('BLOCKED: token is empty — map cannot initialize. Set MAPBOX_TOKEN env var on Railway.');
+      if (!mapContainer.current) dbg('BLOCKED: mapContainer ref is null');
+      return;
+    }
+    try {
+      mapboxgl.accessToken = token;
+      dbg('Creating Mapbox GL map with style dark-v11, center=' + MEKNES + ', zoom=12');
+      const map = new mapboxgl.Map({
+        container: mapContainer.current,
+        style: 'mapbox://styles/mapbox/dark-v11',
+        center: MEKNES,
+        zoom: 12,
+        attributionControl: false,
+      });
+      map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-left');
+      map.on('load', () => {
+        dbg('MAP LOADED SUCCESSFULLY');
+        setMapLoaded(true);
+      });
+      map.on('error', (e) => { dbg('MAP ERROR: ' + JSON.stringify(e.error)); });
+      map.on('styledata', () => { if (!mapLoaded) dbg('Style data loaded'); });
+      mapRef.current = map;
+      dbg('Map instance created, waiting for load event...');
+    } catch (err: unknown) {
+      dbg('EXCEPTION creating map: ' + (err instanceof Error ? err.message : String(err)));
+    }
+    return () => { mapRef.current?.remove(); mapRef.current = null; };
   }, [token]);
 
   // Update markers
@@ -119,6 +173,7 @@ export default function Home() {
     markersRef.current.forEach(m => m.remove());
     markersRef.current = [];
 
+    dbg('Adding ' + mappable.length + ' markers to map (total filtered=' + filtered.length + ')');
     // Add markers for mappable companies
     mappable.forEach(company => {
       const [lng, lat] = getCoords(company);
@@ -262,6 +317,17 @@ export default function Home() {
   const goPrev = () => { if (!route || routeIdx <= 0) return; const i = routeIdx - 1; setRouteIdx(i); const c = route[i].company; setActiveCompany(c); const [lng, lat] = getCoords(c); mapRef.current?.flyTo({ center: [lng, lat], zoom: 17, duration: 400 }); };
   const navigateTo = (c: Company) => window.open(getGoogleMapsUrl(c.lat, c.lng, c.name, c.address), '_blank');
 
+  // Debug panel state
+  const [showDbg, setShowDbg] = useState(false);
+  const [dbgLines, setDbgLines] = useState<string[]>([]);
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const lines = (window as unknown as Record<string, string[]>).__DBG || [];
+      setDbgLines(lines.slice(-50)); // last 50 lines
+    }, 500);
+    return () => clearInterval(iv);
+  }, []);
+
   if (!data) return (
     <div className="h-dvh flex items-center justify-center bg-slate-950">
       <div className="text-center"><div className="w-10 h-10 border-2 border-blue-500 border-t-transparent rounded-full mx-auto mb-3" style={{animation:'spin-slow 1s linear infinite'}}/><p className="text-slate-400 text-sm">Loading companies...</p></div>
@@ -274,6 +340,21 @@ export default function Home() {
 
   return (
     <div className="flex flex-col bg-slate-950 overflow-hidden" style={{ height: '100dvh', width: '100vw' }}>
+      {/* DEBUG TOGGLE */}
+      <button onClick={() => setShowDbg(!showDbg)} className="fixed top-1 right-1 z-[9999] text-[9px] font-mono bg-red-600/80 text-white px-1.5 py-0.5 rounded leading-none">DBG</button>
+
+      {/* DEBUG PANEL */}
+      {showDbg && (
+        <div className="fixed top-6 right-1 z-[9999] w-[340px] max-h-[60dvh] overflow-y-auto bg-black/95 border border-red-500/50 rounded-lg p-2 font-mono text-[10px] text-green-400 leading-relaxed" onClick={e => e.stopPropagation()}>
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-red-400 font-bold">OPTIMAP DEBUG LOG</span>
+            <button onClick={() => { (window as unknown as Record<string, string[]>).__DBG = []; }} className="text-slate-500 text-[9px]">clear</button>
+          </div>
+          <div className="text-slate-500 mb-1">token={token ? token.slice(0,6)+'...' : 'EMPTY'} | data={!!data} | mapLoaded={mapLoaded} | mappable={mappable.length}</div>
+          <pre className="whitespace-pre-wrap break-all">{dbgLines.join('\n')}</pre>
+        </div>
+      )}
+
       {/* MAP */}
       <div className="flex-1 relative">
         <div ref={mapContainer} className="absolute inset-0" />
